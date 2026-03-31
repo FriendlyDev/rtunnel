@@ -1,6 +1,7 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # rtunnel - manage SSH local port forwards ("tunnels") with simple state + optional history.
-# Portable POSIX-ish shell script.
+#
+# Bash-based (intentional): this script uses bash features and must not be run under /bin/sh.
 #
 # Subcommands:
 #   open, ls, close, history, reopen, forget, name
@@ -16,9 +17,10 @@
 #   1 runtime error
 #   2 usage error
 
-set -eu
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 # -------- logging helpers --------
 info() { printf '%s\n' "$*"; }
@@ -28,25 +30,18 @@ usage_die() { warn "$*"; warn "Try: rtunnel --help"; exit 2; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-now_iso() {
-  # ISO-ish without depending on GNU date extensions.
-  date "+%Y-%m-%dT%H:%M:%S%z"
-}
+now_iso() { date "+%Y-%m-%dT%H:%M:%S%z"; }
 
 is_int() {
-  case "${1:-}" in
-    ''|*[!0-9]*) return 1 ;;
-    *) return 0 ;;
-  esac
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
 
 # -------- config loading --------
 load_env_file() {
-  f="$1"
-  [ -f "$f" ] || return 0
-
+  local f="$1"
+  [[ -f "$f" ]] || return 0
   # shellcheck disable=SC1090
-  . "$f"
+  source "$f"
 }
 
 init_config() {
@@ -57,10 +52,10 @@ init_config() {
   : "${RTUNNEL_SSH_BIN:=ssh}"
 
   # Load env file
-  if [ "${RTUNNEL_ENV_FILE:-}" != "" ]; then
+  if [[ "${RTUNNEL_ENV_FILE:-}" != "" ]]; then
     load_env_file "$RTUNNEL_ENV_FILE"
   else
-    base="${XDG_CONFIG_HOME:-$HOME/.config}"
+    local base="${XDG_CONFIG_HOME:-$HOME/.config}"
     load_env_file "$base/rtunnel/rtunnel.env"
     load_env_file "$HOME/.config/rtunnel/rtunnel.env"
   fi
@@ -73,33 +68,38 @@ init_config() {
 
   mkdir -p "$RTUNNEL_ACTIVE_DIR" "$RTUNNEL_DIR"
 
-  if [ ! -f "$RTUNNEL_NEXT_ID_FILE" ]; then
+  # Tighten perms (best-effort)
+  chmod 700 "$RTUNNEL_DIR" "$RTUNNEL_ACTIVE_DIR" 2>/dev/null || true
+
+  if [[ ! -f "$RTUNNEL_NEXT_ID_FILE" ]]; then
     printf '1\n' >"$RTUNNEL_NEXT_ID_FILE"
+    chmod 600 "$RTUNNEL_NEXT_ID_FILE" 2>/dev/null || true
   fi
 
-  if [ "$RTUNNEL_HISTORY_ENABLED" = "1" ] && [ ! -f "$RTUNNEL_HISTORY_FILE" ]; then
+  if [[ "$RTUNNEL_HISTORY_ENABLED" == "1" && ! -f "$RTUNNEL_HISTORY_FILE" ]]; then
     : >"$RTUNNEL_HISTORY_FILE"
+    chmod 600 "$RTUNNEL_HISTORY_FILE" 2>/dev/null || true
   fi
 }
 
 # -------- state helpers --------
 active_file_for_local() {
-  # Store a tab-separated record for active tunnels:
+  # active.tsv columns:
   # local  remote  pid  ssh  name  created_at  extra
   printf '%s/%s.tsv\n' "$RTUNNEL_ACTIVE_DIR" "$1"
 }
 
 pid_alive() {
-  pid="${1:-}"
+  local pid="${1:-}"
   is_int "$pid" || return 1
   kill -0 "$pid" 2>/dev/null
 }
 
 cleanup_stale_active() {
-  # Remove entries whose PIDs are no longer alive
+  shopt -s nullglob
+  local f pid
   for f in "$RTUNNEL_ACTIVE_DIR"/*.tsv; do
-    [ -e "$f" ] || break
-    pid="$(awk -F '\t' 'NR==1{print $3}' "$f" 2>/dev/null || true)"
+    pid="$(awk -F $'\t' 'NR==1{print $3}' "$f" 2>/dev/null || true)"
     if ! pid_alive "$pid"; then
       rm -f "$f" || true
     fi
@@ -107,18 +107,20 @@ cleanup_stale_active() {
 }
 
 get_next_id() {
+  local id
   id="$(cat "$RTUNNEL_NEXT_ID_FILE" 2>/dev/null || printf '1')"
   if ! is_int "$id"; then id=1; fi
   printf '%s\n' "$id"
 }
 
 bump_next_id() {
+  local id
   id="$(get_next_id)"
   printf '%s\n' "$((id + 1))" >"$RTUNNEL_NEXT_ID_FILE"
 }
 
 history_enabled_or_warn() {
-  if [ "$RTUNNEL_HISTORY_ENABLED" != "1" ]; then
+  if [[ "$RTUNNEL_HISTORY_ENABLED" != "1" ]]; then
     warn "History is disabled (RTUNNEL_HISTORY_ENABLED=0). Enable it in rtunnel.env to use this command."
     return 1
   fi
@@ -132,6 +134,8 @@ rtunnel v${VERSION}
 
 Manage SSH local port forwards ("tunnels") with optional history.
 
+NOTE: rtunnel is bash-based and must be run with bash (not /bin/sh).
+
 USAGE:
   rtunnel <command> [args...]
 
@@ -139,25 +143,23 @@ COMMANDS:
   open        Open a tunnel (runs ssh in background and tracks PID)
   ls          List tracked open tunnels (cleans up stale ones)
   close       Close a tunnel by local port
-
 EOF
 
-  if [ "$RTUNNEL_HISTORY_ENABLED" = "1" ]; then
+  if [[ "$RTUNNEL_HISTORY_ENABLED" == "1" ]]; then
     cat <<EOF
   history     Show saved history
   reopen      Reopen a tunnel from history (interactive if no id)
   forget      Delete a history entry (interactive if no id)
   name        Set a friendly name on a history entry (interactive if no id)
-
 EOF
   else
     cat <<EOF
   (history commands hidden because RTUNNEL_HISTORY_ENABLED=0)
-
 EOF
   fi
 
   cat <<'EOF'
+
 OPEN OPTIONS:
   rtunnel open --local <port> --remote <port> --ssh <user@host> [options] [-- <ssh args...>]
   rtunnel open <local> <remote> <user@host> [-- <ssh args...>]
@@ -167,8 +169,8 @@ OPEN OPTIONS:
   --ssh,    --ssh=CONN       SSH connection string (e.g. user@hostname.tld)
   --name NAME                Friendly label (stored in active + history)
   --private                  Do not write to history for this tunnel
-  --bind IP                  Local bind address on the remote side (default: 127.0.0.1)
-                             (This controls the *remote* host in -L local:bind:remote)
+  --bind IP                  Bind address on the remote side of -L (default: 127.0.0.1)
+                             (Controls the "host" in local:bind:remote)
 
 OTHER:
   --help                     Show help
@@ -176,9 +178,9 @@ OTHER:
 
 CONFIG (.env style):
   File search order:
-    1) \$RTUNNEL_ENV_FILE
-    2) \$XDG_CONFIG_HOME/rtunnel/rtunnel.env
-    3) \$HOME/.config/rtunnel/rtunnel.env
+    1) $RTUNNEL_ENV_FILE
+    2) $XDG_CONFIG_HOME/rtunnel/rtunnel.env
+    3) $HOME/.config/rtunnel/rtunnel.env
 
   Important variables:
     RTUNNEL_HISTORY_ENABLED=1|0
@@ -186,16 +188,9 @@ CONFIG (.env style):
     RTUNNEL_DEFAULT_BIND=127.0.0.1
     RTUNNEL_SSH_BIN=ssh
     RTUNNEL_FZF=1|0                  (prefer fzf for interactive commands)
-
-EXAMPLES:
-  rtunnel open --local=80 --remote=8080 --ssh=user@hostname.tld
-  rtunnel open 80 8080 user@hostname.tld -- -i ~/.ssh/id_ed25519 -J jumpbox
-  rtunnel ls
-  rtunnel close 80
-
 EOF
 
-  if [ "$RTUNNEL_HISTORY_ENABLED" != "1" ]; then
+  if [[ "$RTUNNEL_HISTORY_ENABLED" != "1" ]]; then
     warn "History is currently disabled (RTUNNEL_HISTORY_ENABLED=0)."
   fi
 }
@@ -203,42 +198,46 @@ EOF
 # -------- interactive selection --------
 pick_history_id() {
   history_enabled_or_warn || return 1
-  [ -s "$RTUNNEL_HISTORY_FILE" ] || { warn "No history yet."; return 1; }
+  [[ -s "$RTUNNEL_HISTORY_FILE" ]] || { warn "No history yet."; return 1; }
 
-  if [ "$RTUNNEL_FZF" = "1" ] && have fzf; then
-    # Show columns; return selected id (field 1)
-    id="$(awk -F '\t' 'NF>=6{printf "%s\t%s\t%s\t%s\t%s\t%s\n",$1,$2,$3,$4,$5,$6}' "$RTUNNEL_HISTORY_FILE" \
-      | fzf --delimiter='\t' --with-nth=1,2,3,4,5,6 --prompt='rtunnel history> ' \
-      | awk -F '\t' '{print $1}')"
-    [ "${id:-}" != "" ] || return 1
-    printf '%s\n' "$id"
+  if [[ "$RTUNNEL_FZF" == "1" ]] && have fzf; then
+    local picked
+    picked="$(
+      awk -F $'\t' 'NF>=6{printf "%s\t%s\t%s\t%s\t%s\t%s\n",$1,$2,$3,$4,$5,$6}' "$RTUNNEL_HISTORY_FILE" \
+        | fzf --delimiter=$'\t' --with-nth=1,2,3,4,5,6 --prompt='rtunnel history> ' \
+        | awk -F $'\t' '{print $1}'
+    )"
+    [[ -n "${picked:-}" ]] || return 1
+    printf '%s\n' "$picked"
     return 0
   fi
 
   # Fallback: numbered selection (last 20 entries)
+  local tmp
   tmp="$(mktemp)"
   tail -n 20 "$RTUNNEL_HISTORY_FILE" >"$tmp"
 
   info "Select a history entry (showing last 20):"
-  i=1
-  while IFS="$(printf '\t')" read -r hid created l r ssh name extra; do
+  local i=1
+  while IFS=$'\t' read -r hid created l r ssh name extra; do
     printf '  [%d] id=%s  %s  %s->%s  %s  %s\n' "$i" "$hid" "$created" "$l" "$r" "$ssh" "$name"
-    i=$((i + 1))
+    (( i++ ))
   done <"$tmp"
 
   printf '> ' >&2
-  read -r sel
+  local sel
+  read -r sel || true
   rm -f "$tmp"
 
   is_int "$sel" || return 1
-  # Map selection to id by re-reading last 20
+
   i=1
-  while IFS="$(printf '\t')" read -r hid created l r ssh name extra; do
-    if [ "$i" -eq "$sel" ]; then
+  while IFS=$'\t' read -r hid created l r ssh name extra; do
+    if [[ "$i" -eq "$sel" ]]; then
       printf '%s\n' "$hid"
       return 0
     fi
-    i=$((i + 1))
+    (( i++ ))
   done < <(tail -n 20 "$RTUNNEL_HISTORY_FILE")
 
   return 1
@@ -249,7 +248,8 @@ append_history() {
   # args: created_at local remote ssh name extra
   history_enabled_or_warn || return 1
 
-  created_at="$1"; localp="$2"; remotep="$3"; sshc="$4"; name="$5"; extra="$6"
+  local created_at="$1" localp="$2" remotep="$3" sshc="$4" name="$5" extra="$6"
+  local id
   id="$(get_next_id)"
 
   # history.tsv columns:
@@ -260,59 +260,65 @@ append_history() {
 }
 
 history_line_by_id() {
-  id="$1"
+  local id="$1"
   history_enabled_or_warn || return 1
-  awk -F '\t' -v id="$id" 'NF>=6 && $1==id {print; found=1} END{exit(found?0:1)}' "$RTUNNEL_HISTORY_FILE"
+  awk -F $'\t' -v id="$id" 'NF>=6 && $1==id {print; found=1} END{exit(found?0:1)}' "$RTUNNEL_HISTORY_FILE"
 }
 
 rewrite_history_without_id() {
-  id="$1"
+  local id="$1"
   history_enabled_or_warn || return 1
+  local tmp
   tmp="$(mktemp)"
-  awk -F '\t' -v id="$id" '!(NF>=1 && $1==id) {print}' "$RTUNNEL_HISTORY_FILE" >"$tmp"
+  awk -F $'\t' -v id="$id" '!(NF>=1 && $1==id) {print}' "$RTUNNEL_HISTORY_FILE" >"$tmp"
   mv "$tmp" "$RTUNNEL_HISTORY_FILE"
 }
 
 rewrite_history_set_name() {
-  id="$1"
-  new_name="$2"
+  local id="$1"
+  local new_name="$2"
   history_enabled_or_warn || return 1
+  local tmp
   tmp="$(mktemp)"
-  awk -F '\t' -v id="$id" -v nn="$new_name" 'BEGIN{OFS="\t"} { if($1==id){$6=nn} print }' "$RTUNNEL_HISTORY_FILE" >"$tmp"
+  awk -F $'\t' -v id="$id" -v nn="$new_name" 'BEGIN{OFS="\t"} { if($1==id){$6=nn} print }' "$RTUNNEL_HISTORY_FILE" >"$tmp"
   mv "$tmp" "$RTUNNEL_HISTORY_FILE"
 }
 
 # -------- commands --------
 cmd_ls() {
   cleanup_stale_active
-  any=0
+  local any=0
   printf "%-8s %-8s %-8s %-30s %s\n" "LOCAL" "REMOTE" "PID" "SSH" "NAME"
+
+  shopt -s nullglob
+  local f
   for f in "$RTUNNEL_ACTIVE_DIR"/*.tsv; do
-    [ -e "$f" ] || break
     any=1
-    awk -F '\t' 'NR==1{printf "%-8s %-8s %-8s %-30s %s\n",$1,$2,$3,$4,$5}' "$f"
+    awk -F $'\t' 'NR==1{printf "%-8s %-8s %-8s %-30s %s\n",$1,$2,$3,$4,$5}' "$f"
   done
-  if [ "$any" -eq 0 ]; then
+
+  if [[ "$any" -eq 0 ]]; then
     info "No open tunnels tracked."
   fi
 }
 
 cmd_close() {
-  [ $# -ge 1 ] || usage_die "close requires a local port"
-  localp="$1"
+  [[ $# -ge 1 ]] || usage_die "close requires a local port"
+  local localp="$1"
   is_int "$localp" || usage_die "local port must be an integer"
   cleanup_stale_active
 
+  local f
   f="$(active_file_for_local "$localp")"
-  [ -f "$f" ] || { warn "No active tunnel tracked for local port $localp."; exit 1; }
+  [[ -f "$f" ]] || { warn "No active tunnel tracked for local port $localp."; exit 1; }
 
-  pid="$(awk -F '\t' 'NR==1{print $3}' "$f")"
-  remotep="$(awk -F '\t' 'NR==1{print $2}' "$f")"
-  sshc="$(awk -F '\t' 'NR==1{print $4}' "$f")"
+  local pid remotep sshc
+  pid="$(awk -F $'\t' 'NR==1{print $3}' "$f")"
+  remotep="$(awk -F $'\t' 'NR==1{print $2}' "$f")"
+  sshc="$(awk -F $'\t' 'NR==1{print $4}' "$f")"
 
   if pid_alive "$pid"; then
     kill "$pid" 2>/dev/null || true
-    # best-effort grace
     sleep 0.1
     if pid_alive "$pid"; then
       kill -9 "$pid" 2>/dev/null || true
@@ -328,17 +334,13 @@ cmd_close() {
 cmd_open() {
   cleanup_stale_active
 
-  localp=""
-  remotep=""
-  sshc=""
-  name=""
-  private=0
-  bind="${RTUNNEL_DEFAULT_BIND}"
-  passthru=""
+  local localp="" remotep="" sshc="" name=""
+  local private=0
+  local bind="${RTUNNEL_DEFAULT_BIND}"
+  local passthru=()
+  local positional_count=0
 
-  positional_count=0
-
-  while [ $# -gt 0 ]; do
+  while [[ $# -gt 0 ]]; do
     case "$1" in
       --local=*) localp="${1#--local=}" ;;
       --remote=*) remotep="${1#--remote=}" ;;
@@ -347,8 +349,8 @@ cmd_open() {
       --bind=*) bind="${1#--bind=}" ;;
       --private) private=1 ;;
       --local|--remote|--ssh|--name|--bind)
-        key="$1"; shift
-        [ $# -gt 0 ] || usage_die "missing value for $key"
+        local key="$1"; shift
+        [[ $# -gt 0 ]] || usage_die "missing value for $key"
         case "$key" in
           --local) localp="$1" ;;
           --remote) remotep="$1" ;;
@@ -359,17 +361,14 @@ cmd_open() {
         ;;
       --)
         shift
-        # Remaining args are passthru to ssh; preserve as a single string.
-        # Note: This can't perfectly preserve complex quoting once stored.
-        passthru="$*"
+        passthru=("$@")
         break
         ;;
       -*)
-        # Unknown flags treated as ssh passthru, but only if user placed them after `--`.
         usage_die "unknown option: $1 (Tip: pass ssh args after --)"
         ;;
       *)
-        positional_count=$((positional_count + 1))
+        (( positional_count++ ))
         case "$positional_count" in
           1) localp="$1" ;;
           2) remotep="$1" ;;
@@ -381,16 +380,18 @@ cmd_open() {
     shift
   done
 
-  [ "$localp" != "" ] || usage_die "missing --local (or positional local port)"
-  [ "$remotep" != "" ] || usage_die "missing --remote (or positional remote port)"
-  [ "$sshc" != "" ] || usage_die "missing --ssh (or positional ssh connection)"
+  [[ -n "$localp" ]] || usage_die "missing --local (or positional local port)"
+  [[ -n "$remotep" ]] || usage_die "missing --remote (or positional remote port)"
+  [[ -n "$sshc" ]] || usage_die "missing --ssh (or positional ssh connection)"
 
   is_int "$localp" || usage_die "--local must be an integer"
   is_int "$remotep" || usage_die "--remote must be an integer"
 
+  local f
   f="$(active_file_for_local "$localp")"
-  if [ -f "$f" ]; then
-    existing_pid="$(awk -F '\t' 'NR==1{print $3}' "$f" 2>/dev/null || true)"
+  if [[ -f "$f" ]]; then
+    local existing_pid
+    existing_pid="$(awk -F $'\t' 'NR==1{print $3}' "$f" 2>/dev/null || true)"
     if pid_alive "$existing_pid"; then
       usage_die "local port $localp is already tracked as open (pid=$existing_pid). Run: rtunnel close $localp"
     else
@@ -398,30 +399,33 @@ cmd_open() {
     fi
   fi
 
+  local created_at
   created_at="$(now_iso)"
-  if [ "$name" = "" ]; then
+  if [[ -z "$name" ]]; then
     name="$sshc $localp->$remotep"
   fi
 
-  # Build ssh command:
-  # ssh -N -L local:bind:remote ssh_conn [passthru...]
-  #
-  # We run it in background and track pid.
-  # shellcheck disable=SC2086
-  "$RTUNNEL_SSH_BIN" -N -L "${localp}:${bind}:${remotep}" "$sshc" $passthru >/dev/null 2>&1 &
-  pid="$!"
-
-  # Track active
-  # active.tsv columns:
-  # local  remote  pid  ssh  name  created_at  extra
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$localp" "$remotep" "$pid" "$sshc" "$name" "$created_at" "$passthru" >"$f"
-
-  history_id=""
-  if [ "$private" -eq 0 ] && [ "$RTUNNEL_HISTORY_ENABLED" = "1" ]; then
-    history_id="$(append_history "$created_at" "$localp" "$remotep" "$sshc" "$name" "$passthru")"
+  # Store passthru as a printable string for history (best-effort, non-perfect quoting).
+  local extra_str=""
+  if [[ ${#passthru[@]} -gt 0 ]]; then
+    printf -v extra_str "%q " "${passthru[@]}"
+    extra_str="${extra_str% }"
   fi
 
-  if [ "$history_id" != "" ]; then
+  # Launch ssh in background
+  "$RTUNNEL_SSH_BIN" -N -L "${localp}:${bind}:${remotep}" "$sshc" "${passthru[@]}" >/dev/null 2>&1 &
+  local pid="$!"
+
+  # Track active
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$localp" "$remotep" "$pid" "$sshc" "$name" "$created_at" "$extra_str" >"$f"
+  chmod 600 "$f" 2>/dev/null || true
+
+  local history_id=""
+  if [[ "$private" -eq 0 && "$RTUNNEL_HISTORY_ENABLED" == "1" ]]; then
+    history_id="$(append_history "$created_at" "$localp" "$remotep" "$sshc" "$name" "$extra_str")"
+  fi
+
+  if [[ -n "$history_id" ]]; then
     info "Opened: local $localp -> remote $remotep via $sshc (pid=$pid, history_id=$history_id)"
   else
     info "Opened: local $localp -> remote $remotep via $sshc (pid=$pid)"
@@ -430,44 +434,43 @@ cmd_open() {
 
 cmd_history() {
   history_enabled_or_warn || exit 1
-  if [ ! -s "$RTUNNEL_HISTORY_FILE" ]; then
+  if [[ ! -s "$RTUNNEL_HISTORY_FILE" ]]; then
     info "No history yet."
     exit 0
   fi
   printf "%-6s %-24s %-6s %-6s %-28s %s\n" "ID" "CREATED_AT" "LOCAL" "REMOTE" "SSH" "NAME"
-  awk -F '\t' 'NF>=6{printf "%-6s %-24s %-6s %-6s %-28s %s\n",$1,$2,$3,$4,$5,$6}' "$RTUNNEL_HISTORY_FILE"
+  awk -F $'\t' 'NF>=6{printf "%-6s %-24s %-6s %-6s %-28s %s\n",$1,$2,$3,$4,$5,$6}' "$RTUNNEL_HISTORY_FILE"
 }
 
 cmd_reopen() {
   history_enabled_or_warn || exit 1
-  id="${1:-}"
-  if [ "$id" = "" ]; then
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then
     id="$(pick_history_id)" || die "No selection."
   fi
   is_int "$id" || usage_die "id must be an integer"
 
+  local line
   line="$(history_line_by_id "$id" 2>/dev/null || true)"
-  [ "$line" != "" ] || die "No history entry with id=$id"
+  [[ -n "$line" ]] || die "No history entry with id=$id"
 
-  # Parse fields
-  # id created local remote ssh name extra
-  IFS="$(printf '\t')" read -r hid created localp remotep sshc name extra <<EOF
-$line
-EOF
+  local hid created localp remotep sshc name extra
+  IFS=$'\t' read -r hid created localp remotep sshc name extra <<<"$line"
 
-  # Reopen (this creates a new history entry by default; user can use --private manually if desired)
-  if [ "$extra" != "" ]; then
-    # Note: extra is stored as a single string; we pass it after `--`.
-    cmd_open --local="$localp" --remote="$remotep" --ssh="$sshc" --name="$name" -- $extra
-  else
-    cmd_open --local="$localp" --remote="$remotep" --ssh="$sshc" --name="$name"
+  # NOTE: We cannot safely reconstruct arbitrary quoting from 'extra' (stored string).
+  # For now we reopen without extra args. (This avoids eval; safer.)
+  # You can re-open manually with extra args if needed.
+  if [[ -n "$extra" ]]; then
+    warn "Reopen: stored extra ssh args cannot be safely replayed yet; reopening without extras."
   fi
+
+  cmd_open --local="$localp" --remote="$remotep" --ssh="$sshc" --name="$name"
 }
 
 cmd_forget() {
   history_enabled_or_warn || exit 1
-  id="${1:-}"
-  if [ "$id" = "" ]; then
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then
     id="$(pick_history_id)" || die "No selection."
   fi
   is_int "$id" || usage_die "id must be an integer"
@@ -477,15 +480,15 @@ cmd_forget() {
 
 cmd_name() {
   history_enabled_or_warn || exit 1
-  id="${1:-}"
-  new_name="${2:-}"
+  local id="${1:-}"
+  local new_name="${2:-}"
 
-  if [ "$id" = "" ]; then
+  if [[ -z "$id" ]]; then
     id="$(pick_history_id)" || die "No selection."
   fi
   is_int "$id" || usage_die "id must be an integer"
 
-  if [ "$new_name" = "" ]; then
+  if [[ -z "$new_name" ]]; then
     printf 'New name: ' >&2
     read -r new_name
   fi
@@ -500,13 +503,13 @@ init_config
 case "${1:-}" in
   --help|-h|help) print_help; exit 0 ;;
   --version) info "$VERSION"; exit 0 ;;
-  open) shift; cmd_open "$@";;
-  ls|list) shift; cmd_ls "$@";;
-  close) shift; cmd_close "$@";;
-  history) shift; cmd_history "$@";;
-  reopen) shift; cmd_reopen "$@";;
-  forget) shift; cmd_forget "$@";;
-  name) shift; cmd_name "$@";;
-  '') print_help; exit 0 ;;
+  open) shift; cmd_open "$@" ;;
+  ls|list) shift; cmd_ls "$@" ;;
+  close) shift; cmd_close "$@" ;;
+  history) shift; cmd_history "$@" ;;
+  reopen) shift; cmd_reopen "$@" ;;
+  forget) shift; cmd_forget "$@" ;;
+  name) shift; cmd_name "$@" ;;
+  "") print_help; exit 0 ;;
   *) usage_die "unknown command: $1" ;;
 esac

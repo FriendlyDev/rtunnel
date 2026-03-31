@@ -7,7 +7,6 @@ on:
 permissions:
   contents: write
 
-# Opt into Node.js 24 for JavaScript-based actions (e.g. actions/checkout)
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
@@ -32,7 +31,7 @@ jobs:
           set -Eeuo pipefail
           chmod +x ./rtunnel
 
-          VERSION="$(./rtunnel --version)"
+          VERSION="$(bash ./rtunnel --version)"
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Invalid version string from ./rtunnel --version: '$VERSION'" >&2
             exit 1
@@ -78,10 +77,11 @@ jobs:
           mkdir -p dist
 
           cp ./rtunnel ./install.sh dist/
+          cp ./config/rtunnel.env.example dist/rtunnel.env.example
 
           (
             cd dist
-            sha256sum rtunnel install.sh > SHA256SUMS
+            sha256sum rtunnel install.sh rtunnel.env.example > SHA256SUMS
           )
 
       - name: Create GitHub Release and upload assets
@@ -96,4 +96,4 @@ jobs:
           gh release create "$TAG" \
             --title "$TAG" \
             --notes "Automated release for $TAG" \
-            dist/rtunnel dist/install.sh dist/SHA256SUMS
+            dist/rtunnel dist/install.sh dist/rtunnel.env.example dist/SHA256SUMS
