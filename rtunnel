@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # rtunnel - SSH tunnel manager (bash).
 #
+# v0.4.0:
+# - Add --json output (requires jq) for read+write commands
+#   - open/close single -> JSON object
+#   - close --all -> JSON array
+#   - ls/history/favorites -> JSON array
+#
 # v0.3.0:
-# - open: add --replace (requires --name; replaces by active name only)
-# - close: add --all, --stale, and --force
-# - history: add --name, --favorites, --limit
+# - open --replace (requires --name; replaces by active name only)
+# - close --all, --stale, --force
+# - history --name, --favorites, --limit
 #
 # v0.2.1:
 # - "Did you mean?" suggestions (stderr) for name lookups
@@ -24,7 +30,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 # ---------------- logging helpers ----------------
 info() { printf '%s\n' "$*"; }
@@ -35,6 +41,12 @@ usage_die() { warn "$*"; warn "Try: rtunnel --help"; exit 2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 is_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 now_iso() { date "+%Y-%m-%dT%H:%M:%S%z"; }
+
+require_jq_for_json() {
+  if ! have jq; then
+    die "jq is required for --json output (install jq or omit --json)."
+  fi
+}
 
 # ---------------- config loading ----------------
 load_env_file() {
@@ -103,6 +115,95 @@ load_kv_file() {
 
 warnings_enabled() { [[ "${RTUNNEL_NO_WARN}" != "1" ]]; }
 suggestions_enabled() { [[ "${RTUNNEL_NO_SUGGEST}" != "1" ]]; }
+
+# ---------------- json helpers ----------------
+# Transform tab-delimited rows to JSON using jq (required).
+# IMPORTANT: In --json mode, commands should print ONLY JSON on stdout.
+json_active_array() {
+  require_jq_for_json
+  active_list | jq -Rn '
+    [inputs
+     | split("\t")
+     | {
+         local: .[0],
+         remote: .[1],
+         pid: (.[2] | tonumber? // .[2]),
+         ssh: .[3],
+         name: .[4],
+         created_at: .[5]
+       }
+    ]'
+}
+
+json_history_array() {
+  # stdin: history_rows_for_prompt output:
+  # ID, CREATED_AT, LOCAL, REMOTE, SSH, NAME, FAVORITE
+  require_jq_for_json
+  jq -Rn '
+    [inputs
+     | split("\t")
+     | {
+         id: (.[0] | tonumber? // .[0]),
+         created_at: .[1],
+         local: .[2],
+         remote: .[3],
+         ssh: .[4],
+         name: .[5],
+         favorite: (.[6] == "1")
+       }
+    ]'
+}
+
+json_open_object() {
+  # args: created_at local remote pid ssh name bind private history_id
+  require_jq_for_json
+  local created_at="$1" localp="$2" remotep="$3" pid="$4" sshc="$5" name="$6" bind="$7" private="$8" history_id="$9"
+  jq -n \
+    --arg created_at "$created_at" \
+    --arg local "$localp" \
+    --arg remote "$remotep" \
+    --arg ssh "$sshc" \
+    --arg name "$name" \
+    --arg bind "$bind" \
+    --arg pid "$pid" \
+    --argjson private "$private" \
+    --arg history_id "$history_id" \
+    '{
+      created_at: $created_at,
+      local: $local,
+      remote: $remote,
+      pid: ($pid | tonumber? // $pid),
+      ssh: $ssh,
+      name: $name,
+      bind: $bind,
+      private: $private
+    }
+    + (if ($history_id|length)>0 then {history_id: ($history_id|tonumber? // $history_id)} else {} end)
+    '
+}
+
+json_close_object() {
+  # args: created_at local remote pid ssh name bind
+  require_jq_for_json
+  local created_at="$1" localp="$2" remotep="$3" pid="$4" sshc="$5" name="$6" bind="$7"
+  jq -n \
+    --arg created_at "$created_at" \
+    --arg local "$localp" \
+    --arg remote "$remotep" \
+    --arg ssh "$sshc" \
+    --arg name "$name" \
+    --arg bind "$bind" \
+    --arg pid "$pid" \
+    '{
+      created_at: $created_at,
+      local: $local,
+      remote: $remote,
+      pid: ($pid | tonumber? // $pid),
+      ssh: $ssh,
+      name: $name,
+      bind: $bind
+    }'
+}
 
 # ---------------- "did you mean" helpers ----------------
 normalize_name() {
@@ -209,10 +310,11 @@ active_list() {
   shopt -s nullglob
   local f
   for f in "$RTUNNEL_ACTIVE_DIR"/*.env; do
-    local LOCAL REMOTE PID SSH NAME CREATED_AT
-    LOCAL=""; REMOTE=""; PID=""; SSH=""; NAME=""; CREATED_AT=""
+    local LOCAL REMOTE PID SSH NAME CREATED_AT BIND
+    LOCAL=""; REMOTE=""; PID=""; SSH=""; NAME=""; CREATED_AT=""; BIND=""
     load_kv_file "$f" || continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${LOCAL:-}" "${REMOTE:-}" "${PID:-}" "${SSH:-}" "${NAME:-}" "${CREATED_AT:-}"
+    # keep output stable for json: include BIND at end (v0.4.0)
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${LOCAL:-}" "${REMOTE:-}" "${PID:-}" "${SSH:-}" "${NAME:-}" "${CREATED_AT:-}" "${BIND:-}"
   done
 }
 
@@ -223,7 +325,7 @@ active_names_unique() {
 
 active_find_by_name() {
   local needle="$1"
-  while IFS=$'\t' read -r localp _remotep _pid _sshc name _created; do
+  while IFS=$'\t' read -r localp _remotep _pid _sshc name _created _bind; do
     if [[ "$name" == "$needle" ]]; then
       printf '%s\n' "$localp"
       return 0
@@ -326,7 +428,7 @@ history_rows_for_prompt() {
   local id
   while read -r id; do
     history_load_entry "$id" || continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ID" "$CREATED_AT" "$LOCAL" "$REMOTE" "$SSH" "$NAME" "${FAVORITE:-0}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ID" "$CREATED_AT" "$LOCAL" "$REMOTE" "$SSH" "$NAME" "${FAVORITE:-0}" "$BIND"
   done < <(history_iter_ids_desc)
 }
 
@@ -376,7 +478,7 @@ pick_history_id_prompt() {
     local picked
     picked="$(
       cat "$data" \
-        | fzf --delimiter=$'\t' --with-nth=1,2,3,4,5,6,7 --prompt='rtunnel reopen> ' \
+        | fzf --delimiter=$'\t' --with-nth=1,2,3,4,5,6,7,8 --prompt='rtunnel reopen> ' \
         | awk -F $'\t' '{print $1}'
     )"
     rm -f "$data"
@@ -388,8 +490,8 @@ pick_history_id_prompt() {
   info "Select a history entry:"
   local i=1
   local ids=()
-  while IFS=$'\t' read -r id created localp remotep sshc name fav; do
-    printf '  [%d] id=%s  %s  %s->%s  %s  %s  fav=%s\n' "$i" "$id" "$created" "$localp" "$remotep" "$sshc" "$name" "$fav"
+  while IFS=$'\t' read -r id created localp remotep sshc name fav bind; do
+    printf '  [%d] id=%s  %s  %s->%s  %s  %s  fav=%s  bind=%s\n' "$i" "$id" "$created" "$localp" "$remotep" "$sshc" "$name" "$fav" "$bind"
     ids+=("$id")
     (( i++ ))
   done <"$data"
@@ -428,50 +530,55 @@ GLOBAL:
   --help      Show help
   --version   Show version
 
-OPEN:
-  rtunnel open --local PORT --remote PORT --ssh USER@HOST [--name NAME] [--bind HOST] [--private] [--no-warn] [--favorite] [--replace] [--no-suggest] [-- <ssh args...>]
+JSON:
+  --json      Output JSON to stdout (requires jq). In --json mode, commands do not print human text to stdout.
 
-  --replace     Replace an active tunnel with the same --name (name-only). Requires --name.
-  --private     Do not write to history or "last opened" state. Private tunnels cannot be reopened.
-  --no-warn     Suppress warnings for this invocation (also: RTUNNEL_NO_WARN=1).
-  --favorite    Mark the created history entry as a favorite (ignored with --private).
-  --no-suggest  Suppress "Did you mean?" suggestions for this invocation (also: RTUNNEL_NO_SUGGEST=1).
+OPEN:
+  rtunnel open --local PORT --remote PORT --ssh USER@HOST [--name NAME] [--bind HOST] [--private] [--no-warn] [--favorite] [--replace] [--no-suggest] [--json] [-- <ssh args...>]
 
 CLOSE:
-  rtunnel close <local-port|active-name> [--no-suggest]
-  rtunnel close --all [--force]
-  rtunnel close --stale
-
-  --all         Close all tracked tunnels (best-effort). Exits non-zero if any close fails.
-  --stale       Remove stale active entries (dead PIDs) without killing anything (prints removals).
-  --force       Use SIGKILL if SIGTERM does not stop a tunnel.
-
-REOPEN:
-  rtunnel reopen [NAME|ID] [--last] [--prompt] [--no-suggest]
-
-  Default behavior is controlled by RTUNNEL_REOPEN_DEFAULT=prompt|last (default: prompt).
-  --last overrides and reopens the most recently opened non-private tunnel.
+  rtunnel close <local-port|active-name> [--force] [--no-suggest] [--json]
+  rtunnel close --all [--force] [--json]
+  rtunnel close --stale [--json]
 
 HISTORY:
-  rtunnel history [--name NAME] [--favorites] [--limit N]
-
-CONFIG:
-  RTUNNEL_HISTORY_ENABLED=1|0
-  RTUNNEL_FZF=1|0
-  RTUNNEL_DEFAULT_BIND=127.0.0.1
-  RTUNNEL_SSH_BIN=ssh
-  RTUNNEL_REOPEN_DEFAULT=prompt|last
-  RTUNNEL_NO_WARN=1        (disable warnings)
-  RTUNNEL_NO_SUGGEST=1     (disable suggestions)
+  rtunnel history [--name NAME] [--favorites] [--limit N] [--json]
 
 EOF
 }
 
 cmd_ls() {
   cleanup_stale_active
+
+  local as_json=0
+  if [[ "${1:-}" == "--json" ]]; then
+    as_json=1
+    shift
+  fi
+  [[ $# -eq 0 ]] || usage_die "ls takes no arguments (except --json)"
+
+  if [[ "$as_json" -eq 1 ]]; then
+    # active_list now includes bind column; adjust json
+    require_jq_for_json
+    active_list | jq -Rn '
+      [inputs
+       | split("\t")
+       | {
+           local: .[0],
+           remote: .[1],
+           pid: (.[2] | tonumber? // .[2]),
+           ssh: .[3],
+           name: .[4],
+           created_at: .[5],
+           bind: .[6]
+         }
+      ]'
+    return 0
+  fi
+
   printf "%-8s %-8s %-8s %-30s %s\n" "LOCAL" "REMOTE" "PID" "SSH" "NAME"
   local any=0
-  while IFS=$'\t' read -r localp remotep pid sshc name _created; do
+  while IFS=$'\t' read -r localp remotep pid sshc name _created _bind; do
     any=1
     printf "%-8s %-8s %-8s %-30s %s\n" "$localp" "$remotep" "$pid" "$sshc" "$name"
   done < <(active_list)
@@ -487,8 +594,8 @@ close_one_local_port() {
   f="$(active_file_for_local "$localp")"
   [[ -f "$f" ]] || return 1
 
-  local LOCAL REMOTE PID SSH NAME
-  LOCAL=""; REMOTE=""; PID=""; SSH=""; NAME=""
+  local LOCAL REMOTE PID SSH NAME BIND CREATED_AT
+  LOCAL=""; REMOTE=""; PID=""; SSH=""; NAME=""; BIND=""; CREATED_AT=""
   load_kv_file "$f" || return 1
   PID="${PID//\"/}"
 
@@ -506,7 +613,16 @@ close_one_local_port() {
   fi
 
   rm -f "$f" || true
-  info "Closed: ${NAME:-"(unnamed)"} (local ${LOCAL} -> remote ${REMOTE} via ${SSH}, pid=${PID})"
+
+  # export the fields for the caller (for json)
+  CLOSE_LOCAL="$LOCAL"
+  CLOSE_REMOTE="$REMOTE"
+  CLOSE_PID="$PID"
+  CLOSE_SSH="$SSH"
+  CLOSE_NAME="$NAME"
+  CLOSE_BIND="$BIND"
+  CLOSE_CREATED_AT="${CREATED_AT:-}"
+
   [[ "$ok" -eq 0 ]]
 }
 
@@ -515,12 +631,14 @@ cmd_close() {
 
   local force=0
   local no_suggest=0
+  local as_json=0
 
-  # parse flags for close
+  # parse flags for close (allow before mode selection)
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --force) force=1; shift ;;
       --no-suggest) no_suggest=1; shift ;;
+      --json) as_json=1; shift ;;
       --all|--stale) break ;;
       *) break ;;
     esac
@@ -528,34 +646,87 @@ cmd_close() {
 
   if [[ "${1:-}" == "--stale" ]]; then
     shift
-    # print and remove stale entries without killing
+    [[ $# -eq 0 ]] || usage_die "close --stale takes no additional arguments"
+
     shopt -s nullglob
     local f pid localp
     local removed=0
+    local out=""
     for f in "$RTUNNEL_ACTIVE_DIR"/*.env; do
       pid="$(awk -F= '$1=="PID"{print $2}' "$f" 2>/dev/null || true)"
       pid="${pid//\"/}"
       if ! pid_alive "$pid"; then
         localp="$(basename "$f" .env)"
         rm -f "$f" || true
-        info "Removed stale: local $localp (pid $pid)"
+        if [[ "$as_json" -eq 1 ]]; then
+          out+="${localp}"$'\n'
+        else
+          info "Removed stale: local $localp (pid $pid)"
+        fi
         removed=1
       fi
     done
-    [[ "$removed" -eq 0 ]] && info "No stale tunnels found."
+
+    if [[ "$as_json" -eq 1 ]]; then
+      require_jq_for_json
+      # output array of local ports removed
+      printf '%s' "$out" | jq -Rn '[inputs | select(length>0) | {local: .}]'
+    else
+      [[ "$removed" -eq 0 ]] && info "No stale tunnels found."
+    fi
     return 0
   fi
 
   if [[ "${1:-}" == "--all" ]]; then
     shift
-    # close all active entries, best-effort, non-zero if any failed
+    [[ $# -eq 0 ]] || usage_die "close --all takes no additional arguments"
+
     cleanup_stale_active
+
     local any=0
     local failed=0
-    while IFS=$'\t' read -r localp _remotep _pid _ssh _name _created; do
+
+    if [[ "$as_json" -eq 1 ]]; then
+      require_jq_for_json
+      local lines=""
+      while IFS=$'\t' read -r localp _remotep _pid _ssh _name _created _bind; do
+        any=1
+        if close_one_local_port "$localp" "$force"; then
+          # success
+          lines+="$CLOSE_CREATED_AT"$'\t'"$CLOSE_LOCAL"$'\t'"$CLOSE_REMOTE"$'\t'"$CLOSE_PID"$'\t'"$CLOSE_SSH"$'\t'"$CLOSE_NAME"$'\t'"$CLOSE_BIND"$'\n'
+        else
+          failed=1
+          lines+="$CLOSE_CREATED_AT"$'\t'"$CLOSE_LOCAL"$'\t'"$CLOSE_REMOTE"$'\t'"$CLOSE_PID"$'\t'"$CLOSE_SSH"$'\t'"$CLOSE_NAME"$'\t'"$CLOSE_BIND"$'\n'
+        fi
+      done < <(active_list)
+
+      # Output array of closed tunnels (best-effort). Exit code reflects failures.
+      printf '%s' "$lines" | jq -Rn '
+        [inputs
+         | select(length>0)
+         | split("\t")
+         | {
+             created_at: .[0],
+             local: .[1],
+             remote: .[2],
+             pid: (.[3] | tonumber? // .[3]),
+             ssh: .[4],
+             name: .[5],
+             bind: .[6]
+           }
+        ]'
+      [[ "$any" -eq 0 ]] && printf '[]\n'
+      [[ "$failed" -eq 0 ]] || return 1
+      return 0
+    fi
+
+    while IFS=$'\t' read -r localp _remotep _pid _ssh _name _created _bind; do
       any=1
-      if ! close_one_local_port "$localp" "$force"; then
+      if close_one_local_port "$localp" "$force"; then
+        info "Closed: ${CLOSE_NAME:-"(unnamed)"} (local ${CLOSE_LOCAL} -> remote ${CLOSE_REMOTE} via ${CLOSE_SSH}, pid=${CLOSE_PID})"
+      else
         failed=1
+        warn "Failed to close tunnel at local port $localp"
       fi
     done < <(active_list)
 
@@ -566,6 +737,8 @@ cmd_close() {
 
   [[ $# -ge 1 ]] || usage_die "close requires a local port, active name, or --all/--stale"
   local target="$1"
+  shift
+  [[ $# -eq 0 ]] || usage_die "close takes a single target (or --all/--stale)"
 
   local localp=""
   if is_int "$target"; then
@@ -579,7 +752,15 @@ cmd_close() {
     fi
   fi
 
-  close_one_local_port "$localp" "$force" || die "Failed to close tunnel: $target"
+  if ! close_one_local_port "$localp" "$force"; then
+    die "Failed to close tunnel: $target"
+  fi
+
+  if [[ "$as_json" -eq 1 ]]; then
+    json_close_object "$CLOSE_CREATED_AT" "$CLOSE_LOCAL" "$CLOSE_REMOTE" "$CLOSE_PID" "$CLOSE_SSH" "$CLOSE_NAME" "$CLOSE_BIND"
+  else
+    info "Closed: ${CLOSE_NAME:-"(unnamed)"} (local ${CLOSE_LOCAL} -> remote ${CLOSE_REMOTE} via ${CLOSE_SSH}, pid=${CLOSE_PID})"
+  fi
 }
 
 cmd_open() {
@@ -592,6 +773,7 @@ cmd_open() {
   local no_warn=0
   local no_suggest=0
   local replace=0
+  local as_json=0
   local passthru=()
   local positional_count=0
 
@@ -607,6 +789,7 @@ cmd_open() {
       --no-warn) no_warn=1 ;;
       --no-suggest) no_suggest=1 ;;
       --replace) replace=1 ;;
+      --json) as_json=1 ;;
       --local|--remote|--ssh|--name|--bind)
         local key="$1"; shift
         [[ $# -gt 0 ]] || usage_die "missing value for $key"
@@ -660,8 +843,8 @@ cmd_open() {
     local existing_local
     existing_local="$(active_find_by_name "$name" || true)"
     if [[ -n "$existing_local" ]]; then
-      info "Replacing active tunnel named '$name' (local port $existing_local)..."
-      cmd_close --force "$existing_local" >/dev/null 2>&1 || cmd_close "$existing_local" || true
+      # best-effort close
+      cmd_close --force "$existing_local" >/dev/null 2>&1 || cmd_close "$existing_local" >/dev/null 2>&1 || true
     fi
   fi
 
@@ -712,10 +895,14 @@ cmd_open() {
     state_set "last-opened" "$history_id"
   fi
 
-  if [[ -n "$history_id" ]]; then
-    info "Opened: $name (local $localp -> remote $remotep via $sshc, pid=$pid, history_id=$history_id)"
+  if [[ "$as_json" -eq 1 ]]; then
+    json_open_object "$created_at" "$localp" "$remotep" "$pid" "$sshc" "$name" "$bind" "$private" "$history_id"
   else
-    info "Opened: $name (local $localp -> remote $remotep via $sshc, pid=$pid, private=$private)"
+    if [[ -n "$history_id" ]]; then
+      info "Opened: $name (local $localp -> remote $remotep via $sshc, pid=$pid, history_id=$history_id)"
+    else
+      info "Opened: $name (local $localp -> remote $remotep via $sshc, pid=$pid, private=$private)"
+    fi
   fi
 }
 
@@ -725,6 +912,7 @@ cmd_history() {
   local filter_name=""
   local favorites_only=0
   local limit=""
+  local as_json=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -739,13 +927,46 @@ cmd_history() {
         limit="$1"
         ;;
       --limit=*) limit="${1#--limit=}" ;;
-      -h|--help) usage_die "Usage: rtunnel history [--name NAME] [--favorites] [--limit N]" ;;
+      --json) as_json=1 ;;
+      -h|--help) usage_die "Usage: rtunnel history [--name NAME] [--favorites] [--limit N] [--json]" ;;
       *) usage_die "unknown option for history: $1" ;;
     esac
     shift
   done
 
   [[ -z "$limit" || $(is_int "$limit" && echo ok) ]] || usage_die "--limit must be an integer"
+
+  if [[ "$as_json" -eq 1 ]]; then
+    require_jq_for_json
+    local lines=""
+    local count=0
+    local id
+    while read -r id; do
+      history_load_entry "$id" || continue
+      [[ -n "$filter_name" && "$NAME" != "$filter_name" ]] && continue
+      [[ "$favorites_only" -eq 1 && "${FAVORITE:-0}" != "1" ]] && continue
+      lines+="$ID"$'\t'"$CREATED_AT"$'\t'"$LOCAL"$'\t'"$REMOTE"$'\t'"$SSH"$'\t'"$NAME"$'\t'"${FAVORITE:-0}"$'\t'"$BIND"$'\n'
+      count=$((count + 1))
+      [[ -n "$limit" && "$count" -ge "$limit" ]] && break
+    done < <(history_iter_ids_desc)
+
+    printf '%s' "$lines" | jq -Rn '
+      [inputs
+       | select(length>0)
+       | split("\t")
+       | {
+           id: (.[0] | tonumber? // .[0]),
+           created_at: .[1],
+           local: .[2],
+           remote: .[3],
+           ssh: .[4],
+           name: .[5],
+           favorite: (.[6] == "1"),
+           bind: .[7]
+         }
+      ]'
+    return 0
+  fi
 
   printf "%-6s %-24s %-6s %-6s %-28s %-6s %s\n" "ID" "CREATED_AT" "LOCAL" "REMOTE" "SSH" "FAV" "NAME"
   local any=0
@@ -754,20 +975,13 @@ cmd_history() {
   while read -r id; do
     history_load_entry "$id" || continue
 
-    if [[ -n "$filter_name" && "$NAME" != "$filter_name" ]]; then
-      continue
-    fi
-    if [[ "$favorites_only" -eq 1 && "${FAVORITE:-0}" != "1" ]]; then
-      continue
-    fi
+    [[ -n "$filter_name" && "$NAME" != "$filter_name" ]] && continue
+    [[ "$favorites_only" -eq 1 && "${FAVORITE:-0}" != "1" ]] && continue
 
     any=1
     printf "%-6s %-24s %-6s %-6s %-28s %-6s %s\n" "$ID" "$CREATED_AT" "$LOCAL" "$REMOTE" "$SSH" "${FAVORITE:-0}" "$NAME"
-
     count=$((count + 1))
-    if [[ -n "$limit" && "$count" -ge "$limit" ]]; then
-      break
-    fi
+    [[ -n "$limit" && "$count" -ge "$limit" ]] && break
   done < <(history_iter_ids_desc)
 
   [[ "$any" -eq 0 ]] && info "No history yet."
@@ -912,6 +1126,12 @@ cmd_fav() {
     shift
   fi
 
+  local as_json=0
+  if [[ "${1:-}" == "--json" ]]; then
+    as_json=1
+    shift
+  fi
+
   [[ $# -ge 1 ]] || usage_die "fav requires a history id or name"
   local target="$1"
   local id=""
@@ -926,7 +1146,16 @@ cmd_fav() {
     fi
   fi
   set_favorite "$id" "1"
-  info "Favorited: id=$id"
+
+  if [[ "$as_json" -eq 1 ]]; then
+    # output the updated entry object
+    history_load_entry "$id" || die "History entry not found: $id"
+    require_jq_for_json
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ID" "$CREATED_AT" "$LOCAL" "$REMOTE" "$SSH" "$NAME" "${FAVORITE:-0}" "$BIND" \
+      | jq -Rn 'inputs | split("\t") | {id:(.[0]|tonumber?//.[0]),created_at:.[1],local:.[2],remote:.[3],ssh:.[4],name:.[5],favorite:(.[6]=="1"),bind:.[7]}'
+  else
+    info "Favorited: id=$id"
+  fi
 }
 
 cmd_unfav() {
@@ -934,6 +1163,12 @@ cmd_unfav() {
   local no_suggest=0
   if [[ "${1:-}" == "--no-suggest" ]]; then
     no_suggest=1
+    shift
+  fi
+
+  local as_json=0
+  if [[ "${1:-}" == "--json" ]]; then
+    as_json=1
     shift
   fi
 
@@ -951,11 +1186,55 @@ cmd_unfav() {
     fi
   fi
   set_favorite "$id" "0"
-  info "Unfavorited: id=$id"
+
+  if [[ "$as_json" -eq 1 ]]; then
+    history_load_entry "$id" || die "History entry not found: $id"
+    require_jq_for_json
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ID" "$CREATED_AT" "$LOCAL" "$REMOTE" "$SSH" "$NAME" "${FAVORITE:-0}" "$BIND" \
+      | jq -Rn 'inputs | split("\t") | {id:(.[0]|tonumber?//.[0]),created_at:.[1],local:.[2],remote:.[3],ssh:.[4],name:.[5],favorite:(.[6]=="1"),bind:.[7]}'
+  else
+    info "Unfavorited: id=$id"
+  fi
 }
 
 cmd_favorites() {
   history_enabled_or_warn || exit 1
+
+  local as_json=0
+  if [[ "${1:-}" == "--json" ]]; then
+    as_json=1
+    shift
+  fi
+  [[ $# -eq 0 ]] || usage_die "favorites takes no arguments (except --json)"
+
+  if [[ "$as_json" -eq 1 ]]; then
+    require_jq_for_json
+    local lines=""
+    local id
+    while read -r id; do
+      history_load_entry "$id" || continue
+      [[ "${FAVORITE:-0}" == "1" ]] || continue
+      lines+="$ID"$'\t'"$CREATED_AT"$'\t'"$LOCAL"$'\t'"$REMOTE"$'\t'"$SSH"$'\t'"$NAME"$'\t'"${FAVORITE:-0}"$'\t'"$BIND"$'\n'
+    done < <(history_iter_ids_desc)
+
+    printf '%s' "$lines" | jq -Rn '
+      [inputs
+       | select(length>0)
+       | split("\t")
+       | {
+           id: (.[0] | tonumber? // .[0]),
+           created_at: .[1],
+           local: .[2],
+           remote: .[3],
+           ssh: .[4],
+           name: .[5],
+           favorite: (.[6] == "1"),
+           bind: .[7]
+         }
+      ]'
+    return 0
+  fi
+
   printf "%-6s %-24s %-6s %-6s %-28s %-6s %s\n" "ID" "CREATED_AT" "LOCAL" "REMOTE" "SSH" "FAV" "NAME"
   local any=0
   local id

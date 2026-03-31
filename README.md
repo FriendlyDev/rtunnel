@@ -46,23 +46,7 @@ Ensure `~/.local/bin` is in your `PATH`.
 ### Install a specific version
 
 ```bash
-curl -fsSL https://github.com/FriendlyDev/rtunnel/releases/latest/download/install.sh | bash -s -- --version v0.3.0
-```
-
-### Install location options
-
-```bash
-# Install into PREFIX/bin (default PREFIX is ~/.local)
-curl -fsSL https://github.com/FriendlyDev/rtunnel/releases/latest/download/install.sh | bash -s -- --prefix "$HOME/.local"
-
-# Or specify an explicit bin directory
-curl -fsSL https://github.com/FriendlyDev/rtunnel/releases/latest/download/install.sh | bash -s -- --bindir "$HOME/bin"
-```
-
-### (Not recommended) Skip checksum verification
-
-```bash
-curl -fsSL https://github.com/FriendlyDev/rtunnel/releases/latest/download/install.sh | bash -s -- --no-verify
+curl -fsSL https://github.com/FriendlyDev/rtunnel/releases/latest/download/install.sh | bash -s -- --version v0.4.0
 ```
 
 ---
@@ -71,28 +55,14 @@ curl -fsSL https://github.com/FriendlyDev/rtunnel/releases/latest/download/insta
 
 ### Open a tunnel
 
-Named args (any order):
-
 ```bash
-rtunnel open --local=80 --remote=8080 --ssh=user@hostname.tld
-```
-
-Positional args:
-
-```bash
-rtunnel open 80 8080 user@hostname.tld
+rtunnel open --name "grafana-staging" --local=80 --remote=8080 --ssh=user@hostname.tld
 ```
 
 Pass additional SSH flags after `--`:
 
 ```bash
-rtunnel open --local=80 --remote=8080 --ssh=user@hostname.tld -- -i ~/.ssh/id_ed25519 -J jumpbox
-```
-
-Name it (recommended):
-
-```bash
-rtunnel open --name "grafana-staging" --local=80 --remote=8080 --ssh=user@hostname.tld
+rtunnel open --name "grafana-staging" --local=80 --remote=8080 --ssh=user@hostname.tld -- -i ~/.ssh/id_ed25519 -J jumpbox
 ```
 
 Mark it as a favorite at creation time:
@@ -102,7 +72,7 @@ rtunnel open --favorite --name "grafana-staging" --local=80 --remote=8080 --ssh=
 ```
 
 #### Replace by name (restart a tunnel)
-If you re-run the same named tunnel frequently, you can replace any currently-active tunnel with the same name:
+Replace any currently-active tunnel with the same name:
 
 ```bash
 rtunnel open --replace --name "grafana-staging" --local=80 --remote=8080 --ssh=user@hostname.tld
@@ -123,20 +93,39 @@ By default, `rtunnel open --private ...` prints a warning explaining this. To si
 - set `RTUNNEL_NO_WARN=1`, or
 - pass `--no-warn` to `open`.
 
+---
+
+## JSON output (requires jq)
+
+Many commands support `--json` to emit machine-readable output on stdout.
+
+**`jq` is required when using `--json`.** If `jq` is not installed and you pass `--json`, `rtunnel` will exit with an error.
+
+Output contract:
+- Single-target commands output a **single JSON object** (`open --json`, `close 80 --json`)
+- Multi-target commands output a **JSON array** (`ls --json`, `history --json`, `favorites --json`, `close --all --json`)
+
 Examples:
 
 ```bash
-rtunnel open --private --name "one-off" --local=3306 --remote=3306 --ssh=user@db-host
-rtunnel open --private --no-warn --name "one-off" --local=3306 --remote=3306 --ssh=user@db-host
+rtunnel ls --json | jq .
+rtunnel history --favorites --json | jq .
+rtunnel open --name test --local 9999 --remote 9999 --ssh user@host --json | jq .
+rtunnel close test --json | jq .
+rtunnel close --all --json | jq .
 ```
 
-### List open tunnels
+---
+
+## List open tunnels
 
 ```bash
 rtunnel ls
 ```
 
-### Close tunnels
+---
+
+## Close tunnels
 
 Close by local port:
 
@@ -171,8 +160,6 @@ rtunnel close --stale
 ---
 
 ## History
-
-History is **enabled by default**, and is controlled by `RTUNNEL_HISTORY_ENABLED`.
 
 Show history:
 
@@ -240,8 +227,6 @@ To disable suggestions:
 
 ## Favorites
 
-Favorites are stored in history metadata:
-
 ```bash
 rtunnel fav 42
 rtunnel unfav 42
@@ -256,20 +241,6 @@ rtunnel fav grafana-staging
 
 ---
 
-## Security model / defaults
-
-`rtunnel` aims to be safe-by-default:
-
-- Uses SSH `-N` (no remote command execution).
-- Uses remote bind host `127.0.0.1` by default (loopback on the remote side).
-- Avoids `eval`.
-- Tracks tunnels by PID and cleans up stale entries when listing.
-- Release installer verifies SHA256 checksums (unless you opt out).
-
-**Important:** Port forwarding can expose services unintentionally. Always understand what you’re binding to and who can reach your forwarded port.
-
----
-
 ## Configuration
 
 `rtunnel` loads an optional `.env` style config file.
@@ -279,43 +250,6 @@ Search order:
 1. `$RTUNNEL_ENV_FILE` (if set)
 2. `$XDG_CONFIG_HOME/rtunnel/rtunnel.env`
 3. `$HOME/.config/rtunnel/rtunnel.env`
-
-Start by copying the example config from the latest release:
-
-```bash
-mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/rtunnel"
-curl -fsSL https://github.com/FriendlyDev/rtunnel/releases/latest/download/rtunnel.env.example \
-  -o "${XDG_CONFIG_HOME:-$HOME/.config}/rtunnel/rtunnel.env"
-```
-
-Example settings you may want:
-
-```bash
-RTUNNEL_HISTORY_ENABLED=1
-RTUNNEL_FZF=1
-RTUNNEL_DEFAULT_BIND=127.0.0.1
-RTUNNEL_SSH_BIN=ssh
-
-# reopen defaults
-RTUNNEL_REOPEN_DEFAULT=prompt
-
-# warning control
-RTUNNEL_NO_WARN=0
-
-# suggestion control
-RTUNNEL_NO_SUGGEST=0
-```
-
----
-
-## Interactive selection (fzf)
-
-If `fzf` is installed and `RTUNNEL_FZF=1`, interactive commands like `rtunnel reopen` will use it. Otherwise `rtunnel` falls back to a simple numbered prompt.
-
-Install fzf:
-
-- macOS (Homebrew): `brew install fzf`
-- Linux: use your distro’s package manager
 
 ---
 
