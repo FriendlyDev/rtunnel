@@ -3,6 +3,7 @@
 `rtunnel` is a security-minded, user-friendly SSH tunnel manager. It wraps SSH **local port forwarding** (`ssh -L ...`) with simple commands to **open**, **list**, and **close** tunnels, with optional **history** so you can quickly reconnect later.
 
 It’s designed for macOS and Linux, and implemented as a small **bash** script with:
+
 - safe defaults (binds to loopback by default)
 - no `eval`
 - optional history (enabled by default)
@@ -94,10 +95,22 @@ Name it (recommended):
 rtunnel open --name "grafana-staging" --local=80 --remote=8080 --ssh=user@hostname.tld
 ```
 
-Private (does not store into history even if history is enabled):
+### Private tunnels (no history)
+
+If you open a tunnel with `--private`, `rtunnel` will **not** save it to history and will **not** update “last opened” state. This means:
+
+- `rtunnel reopen` **cannot** reopen private tunnels.
+
+By default, `rtunnel open --private ...` prints a warning explaining this. To silence warnings:
+
+- set `RTUNNEL_NO_WARN=1`, or
+- pass `--no-warn` to `open`.
+
+Examples:
 
 ```bash
-rtunnel open --private --name "one-off" --local=80 --remote=8080 --ssh=user@hostname.tld
+rtunnel open --private --name "one-off" --local=3306 --remote=3306 --ssh=user@db-host
+rtunnel open --private --no-warn --name "one-off" --local=3306 --remote=3306 --ssh=user@db-host
 ```
 
 ### List open tunnels
@@ -106,36 +119,25 @@ rtunnel open --private --name "one-off" --local=80 --remote=8080 --ssh=user@host
 rtunnel ls
 ```
 
-### Close a tunnel (by local port)
+### Close a tunnel
+
+Close by local port:
 
 ```bash
 rtunnel close 80
 ```
 
-> Note: Closing by **friendly name** is planned but not available yet.
+Close by active name:
+
+```bash
+rtunnel close grafana-staging
+```
 
 ---
 
-## Security model / defaults
-
-`rtunnel` aims to be safe-by-default:
-
-- Uses SSH `-N` (no remote command execution).
-- Uses remote bind host `127.0.0.1` by default (loopback on the remote side).
-- (Planned / recommended) uses local bind host `127.0.0.1` by default (loopback on the local side) so forwarded ports are not exposed to your LAN.
-- Avoids `eval`.
-- Tracks tunnels by PID and cleans up stale entries when listing.
-- Release installer verifies SHA256 checksums (unless you opt out).
-
-**Important:** Port forwarding can expose services unintentionally. Always understand what you’re binding to and who can reach your forwarded port.
-
----
-
-## History (optional)
+## History
 
 History is **enabled by default**, and is controlled by `RTUNNEL_HISTORY_ENABLED`.
-
-When enabled, `rtunnel` records tunnels you open, so you can reopen them quickly later.
 
 Show history:
 
@@ -143,7 +145,7 @@ Show history:
 rtunnel history
 ```
 
-Reopen a tunnel from history (interactive if `fzf` is installed and enabled):
+Reopen a tunnel from history (interactive; uses `fzf` if installed and enabled):
 
 ```bash
 rtunnel reopen
@@ -153,6 +155,12 @@ Reopen by history id:
 
 ```bash
 rtunnel reopen 42
+```
+
+Reopen the most recently opened (non-private) tunnel:
+
+```bash
+rtunnel reopen --last
 ```
 
 Forget an entry:
@@ -167,7 +175,37 @@ Rename an entry:
 rtunnel name 42 "new name"
 ```
 
-If history is disabled, these commands are hidden from help and will warn if invoked.
+---
+
+## Favorites
+
+Favorites are stored in history metadata:
+
+```bash
+rtunnel fav 42
+rtunnel unfav 42
+rtunnel favorites
+```
+
+You can also favorite by most-recent name match:
+
+```bash
+rtunnel fav grafana-staging
+```
+
+---
+
+## Security model / defaults
+
+`rtunnel` aims to be safe-by-default:
+
+- Uses SSH `-N` (no remote command execution).
+- Uses remote bind host `127.0.0.1` by default (loopback on the remote side).
+- Avoids `eval`.
+- Tracks tunnels by PID and cleans up stale entries when listing.
+- Release installer verifies SHA256 checksums (unless you opt out).
+
+**Important:** Port forwarding can expose services unintentionally. Always understand what you’re binding to and who can reach your forwarded port.
 
 ---
 
@@ -181,7 +219,7 @@ Search order:
 2. `$XDG_CONFIG_HOME/rtunnel/rtunnel.env`
 3. `$HOME/.config/rtunnel/rtunnel.env`
 
-Start by copying the example config from the repository:
+Start by copying the example config from the latest release:
 
 ```bash
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/rtunnel"
@@ -196,9 +234,13 @@ RTUNNEL_HISTORY_ENABLED=1
 RTUNNEL_FZF=1
 RTUNNEL_DEFAULT_BIND=127.0.0.1
 RTUNNEL_SSH_BIN=ssh
-```
 
-> Note: The exact set of supported variables depends on the version you’re running. Check `rtunnel --help` for the authoritative list.
+# reopen defaults
+RTUNNEL_REOPEN_DEFAULT=prompt
+
+# warning control
+RTUNNEL_NO_WARN=0
+```
 
 ---
 
@@ -207,6 +249,7 @@ RTUNNEL_SSH_BIN=ssh
 If `fzf` is installed and `RTUNNEL_FZF=1`, interactive commands like `rtunnel reopen` will use it. Otherwise `rtunnel` falls back to a simple numbered prompt.
 
 Install fzf:
+
 - macOS (Homebrew): `brew install fzf`
 - Linux: use your distro’s package manager
 
@@ -242,19 +285,9 @@ This repository can publish releases automatically on push to `master`:
 - If tag `vX.Y.Z` does not exist, it creates:
   - an **annotated git tag**
   - a GitHub Release
-  - release assets: `rtunnel`, `install.sh`, `SHA256SUMS`
+  - release assets: `rtunnel`, `install.sh`, `rtunnel.env.example`, `SHA256SUMS`
 
 This makes “bump version → push → release” the only manual steps.
-
----
-
-## Roadmap
-
-Planned improvements:
-- Close and reopen tunnels by **friendly name**
-- Favorites (`fav`, `favorites`, `unfav`)
-- Secure round-trip replay of arbitrary extra SSH args (stored as a structured list, not a single string)
-- “Did you mean?” suggestions for mistyped names
 
 ---
 
