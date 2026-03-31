@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # rtunnel - SSH tunnel manager (bash).
 #
+# v0.3.0:
+# - open: add --replace (requires --name; replaces by active name only)
+# - close: add --all, --stale, and --force
+# - history: add --name, --favorites, --limit
+#
 # v0.2.1:
 # - "Did you mean?" suggestions (stderr) for name lookups
 # - Suggestions suppressible via RTUNNEL_NO_SUGGEST=1 or --no-suggest
-# - Suggestions are NOT suppressed by RTUNNEL_NO_WARN
 #
 # v0.2.0:
-# - Explicit bash script (not POSIX sh)
 # - Structured history storage + safe arg replay (no eval)
 # - Active-only name uniqueness
-# - reopen default mode configurable (prompt/last) + --last override
+# - reopen configurable (prompt/last) + --last override
 # - favorites (fav/unfav/favorites)
 #
 # Private tunnels:
@@ -21,7 +24,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="0.2.1"
+VERSION="0.3.0"
 
 # ---------------- logging helpers ----------------
 info() { printf '%s\n' "$*"; }
@@ -98,30 +101,18 @@ load_kv_file() {
   source "$f"
 }
 
-warnings_enabled() {
-  [[ "${RTUNNEL_NO_WARN}" != "1" ]]
-}
-
-suggestions_enabled() {
-  [[ "${RTUNNEL_NO_SUGGEST}" != "1" ]]
-}
+warnings_enabled() { [[ "${RTUNNEL_NO_WARN}" != "1" ]]; }
+suggestions_enabled() { [[ "${RTUNNEL_NO_SUGGEST}" != "1" ]]; }
 
 # ---------------- "did you mean" helpers ----------------
-# Domain-only suggestions:
-# - close -> active names
-# - reopen/fav/unfav -> history names
 normalize_name() {
-  # lower-case, map separators to spaces, squeeze whitespace
-  # shellcheck disable=SC2001
   printf '%s' "$1" \
     | tr '[:upper:]' '[:lower:]' \
     | tr '-_.' '   ' \
     | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
 }
 
-name_tokens() {
-  normalize_name "$1" | tr ' ' '\n' | awk 'NF>0{print}'
-}
+name_tokens() { normalize_name "$1" | tr ' ' '\n' | awk 'NF>0{print}'; }
 
 contains_all_tokens() {
   local needle="$1" cand="$2"
@@ -136,44 +127,23 @@ contains_all_tokens() {
 }
 
 score_candidate() {
-  # Higher is better.
-  # Inputs: needle candidate
   local needle="$1" cand="$2"
   local n c
   n="$(normalize_name "$needle")"
   c="$(normalize_name "$cand")"
 
   local score=0
+  [[ "$c" == "$n" ]] && score=$((score + 1000))
+  [[ "$c" == "$n"* ]] && score=$((score + 300))
+  [[ "$c" == *"$n"* ]] && score=$((score + 200))
+  contains_all_tokens "$needle" "$cand" && score=$((score + 120))
 
-  if [[ "$c" == "$n" ]]; then
-    score=$((score + 1000))
-  fi
-  if [[ "$c" == "$n"* ]]; then
-    score=$((score + 300))
-  fi
-  if [[ "$c" == *"$n"* ]]; then
-    score=$((score + 200))
-  fi
-  if contains_all_tokens "$needle" "$cand"; then
-    score=$((score + 120))
-  fi
-
-  # Prefer shorter candidates if equal
   score=$((score - ${#c}))
   printf '%s\n' "$score"
 }
 
 suggest_from_candidates() {
-  # usage: suggest_from_candidates <needle> <limit>
-  # reads candidates from stdin, prints suggestions (one per line) to stdout
   local needle="$1" limit="$2"
-
-  # score<TAB>candidate
-  awk -v needle="$needle" '
-    BEGIN{ }
-    { print $0 }
-  ' >/dev/null
-
   local scored
   scored="$(
     while IFS= read -r cand; do
@@ -181,8 +151,6 @@ suggest_from_candidates() {
       printf '%s\t%s\n' "$(score_candidate "$needle" "$cand")" "$cand"
     done
   )"
-
-  # filter >0, sort by score desc, unique candidates, take top N
   printf '%s\n' "$scored" \
     | awk -F $'\t' '$1>0{print}' \
     | sort -t $'\t' -k1,1nr -k2,2 \
@@ -191,7 +159,6 @@ suggest_from_candidates() {
 }
 
 print_suggestions_stderr() {
-  # usage: print_suggestions_stderr <needle> <domain> <no_suggest_flag>
   local needle="$1" domain="$2" no_suggest_flag="${3:-0}"
 
   [[ "$no_suggest_flag" -eq 1 ]] && return 0
@@ -199,25 +166,16 @@ print_suggestions_stderr() {
 
   local candidates=""
   case "$domain" in
-    active)
-      candidates="$(active_names_unique || true)"
-      ;;
-    history)
-      candidates="$(history_names_unique || true)"
-      ;;
-    *)
-      return 0
-      ;;
+    active) candidates="$(active_names_unique || true)" ;;
+    history) candidates="$(history_names_unique || true)" ;;
+    *) return 0 ;;
   esac
-
   [[ -n "$candidates" ]] || return 0
 
   local sug
   sug="$(
-    printf '%s\n' "$candidates" \
-      | suggest_from_candidates "$needle" 3
+    printf '%s\n' "$candidates" | suggest_from_candidates "$needle" 3
   )"
-
   [[ -n "$sug" ]] || return 0
 
   warn "Did you mean:"
@@ -259,7 +217,6 @@ active_list() {
 }
 
 active_names_unique() {
-  # Active domain suggestion source (unique, non-empty)
   cleanup_stale_active
   active_list | awk -F $'\t' 'NF>=5 && $5!=""{print $5}' | awk '!seen[$0]++'
 }
@@ -302,7 +259,6 @@ history_meta_for_id() { printf '%s/meta.env\n' "$(history_dir_for_id "$1")"; }
 history_args_for_id() { printf '%s/args.txt\n' "$(history_dir_for_id "$1")"; }
 
 history_write_entry() {
-  # returns id on stdout
   history_enabled_or_warn || return 1
 
   local created_at="$1" localp="$2" remotep="$3" sshc="$4" name="$5" bind="$6" fav="$7"
@@ -401,7 +357,6 @@ resolve_id_by_name_most_recent() {
 # ---------------- selection helpers ----------------
 pick_history_id_prompt() {
   local name_filter="${1:-}"
-
   history_enabled_or_warn || return 1
 
   local data
@@ -460,7 +415,7 @@ USAGE:
 COMMANDS:
   open        Open a tunnel
   ls          List tracked open tunnels
-  close       Close a tunnel (by local port, or by active name)
+  close       Close tunnels
   history     Show saved history
   reopen      Reopen a tunnel from history (prompt by default)
   forget      Delete a history entry
@@ -474,18 +429,31 @@ GLOBAL:
   --version   Show version
 
 OPEN:
-  rtunnel open --local PORT --remote PORT --ssh USER@HOST [--name NAME] [--bind HOST] [--private] [--no-warn] [--favorite] [--no-suggest] [-- <ssh args...>]
+  rtunnel open --local PORT --remote PORT --ssh USER@HOST [--name NAME] [--bind HOST] [--private] [--no-warn] [--favorite] [--replace] [--no-suggest] [-- <ssh args...>]
 
+  --replace     Replace an active tunnel with the same --name (name-only). Requires --name.
   --private     Do not write to history or "last opened" state. Private tunnels cannot be reopened.
   --no-warn     Suppress warnings for this invocation (also: RTUNNEL_NO_WARN=1).
   --favorite    Mark the created history entry as a favorite (ignored with --private).
   --no-suggest  Suppress "Did you mean?" suggestions for this invocation (also: RTUNNEL_NO_SUGGEST=1).
+
+CLOSE:
+  rtunnel close <local-port|active-name> [--no-suggest]
+  rtunnel close --all [--force]
+  rtunnel close --stale
+
+  --all         Close all tracked tunnels (best-effort). Exits non-zero if any close fails.
+  --stale       Remove stale active entries (dead PIDs) without killing anything (prints removals).
+  --force       Use SIGKILL if SIGTERM does not stop a tunnel.
 
 REOPEN:
   rtunnel reopen [NAME|ID] [--last] [--prompt] [--no-suggest]
 
   Default behavior is controlled by RTUNNEL_REOPEN_DEFAULT=prompt|last (default: prompt).
   --last overrides and reopens the most recently opened non-private tunnel.
+
+HISTORY:
+  rtunnel history [--name NAME] [--favorites] [--limit N]
 
 CONFIG:
   RTUNNEL_HISTORY_ENABLED=1|0
@@ -507,27 +475,99 @@ cmd_ls() {
     any=1
     printf "%-8s %-8s %-8s %-30s %s\n" "$localp" "$remotep" "$pid" "$sshc" "$name"
   done < <(active_list)
+  [[ "$any" -eq 0 ]] && info "No open tunnels tracked."
+}
 
-  if [[ "$any" -eq 0 ]]; then
-    info "No open tunnels tracked."
+close_one_local_port() {
+  # args: local_port force
+  local localp="$1"
+  local force="$2"
+
+  local f
+  f="$(active_file_for_local "$localp")"
+  [[ -f "$f" ]] || return 1
+
+  local LOCAL REMOTE PID SSH NAME
+  LOCAL=""; REMOTE=""; PID=""; SSH=""; NAME=""
+  load_kv_file "$f" || return 1
+  PID="${PID//\"/}"
+
+  local ok=0
+  if pid_alive "$PID"; then
+    kill "$PID" 2>/dev/null || true
+    sleep 0.1
+    if pid_alive "$PID"; then
+      if [[ "$force" -eq 1 ]]; then
+        kill -9 "$PID" 2>/dev/null || true
+        sleep 0.05
+      fi
+    fi
+    pid_alive "$PID" && ok=1
   fi
+
+  rm -f "$f" || true
+  info "Closed: ${NAME:-"(unnamed)"} (local ${LOCAL} -> remote ${REMOTE} via ${SSH}, pid=${PID})"
+  [[ "$ok" -eq 0 ]]
 }
 
 cmd_close() {
-  [[ $# -ge 1 ]] || usage_die "close requires a local port or active name"
   cleanup_stale_active
 
+  local force=0
   local no_suggest=0
-  if [[ "${1:-}" == "--no-suggest" ]]; then
-    no_suggest=1
+
+  # parse flags for close
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --no-suggest) no_suggest=1; shift ;;
+      --all|--stale) break ;;
+      *) break ;;
+    esac
+  done
+
+  if [[ "${1:-}" == "--stale" ]]; then
     shift
+    # print and remove stale entries without killing
+    shopt -s nullglob
+    local f pid localp
+    local removed=0
+    for f in "$RTUNNEL_ACTIVE_DIR"/*.env; do
+      pid="$(awk -F= '$1=="PID"{print $2}' "$f" 2>/dev/null || true)"
+      pid="${pid//\"/}"
+      if ! pid_alive "$pid"; then
+        localp="$(basename "$f" .env)"
+        rm -f "$f" || true
+        info "Removed stale: local $localp (pid $pid)"
+        removed=1
+      fi
+    done
+    [[ "$removed" -eq 0 ]] && info "No stale tunnels found."
+    return 0
   fi
 
-  [[ $# -ge 1 ]] || usage_die "close requires a local port or active name"
+  if [[ "${1:-}" == "--all" ]]; then
+    shift
+    # close all active entries, best-effort, non-zero if any failed
+    cleanup_stale_active
+    local any=0
+    local failed=0
+    while IFS=$'\t' read -r localp _remotep _pid _ssh _name _created; do
+      any=1
+      if ! close_one_local_port "$localp" "$force"; then
+        failed=1
+      fi
+    done < <(active_list)
 
+    [[ "$any" -eq 0 ]] && info "No open tunnels tracked."
+    [[ "$failed" -eq 0 ]] || return 1
+    return 0
+  fi
+
+  [[ $# -ge 1 ]] || usage_die "close requires a local port, active name, or --all/--stale"
   local target="$1"
-  local localp=""
 
+  local localp=""
   if is_int "$target"; then
     localp="$target"
   else
@@ -535,29 +575,11 @@ cmd_close() {
     if [[ -z "$localp" ]]; then
       warn "No active tunnel found with name: $target"
       print_suggestions_stderr "$target" "active" "$no_suggest"
-      exit 1
+      return 1
     fi
   fi
 
-  local f
-  f="$(active_file_for_local "$localp")"
-  [[ -f "$f" ]] || die "No active tunnel tracked for local port $localp"
-
-  local LOCAL REMOTE PID SSH NAME
-  LOCAL=""; REMOTE=""; PID=""; SSH=""; NAME=""
-  load_kv_file "$f" || die "Failed to read active state"
-  PID="${PID//\"/}"
-
-  if pid_alive "$PID"; then
-    kill "$PID" 2>/dev/null || true
-    sleep 0.1
-    if pid_alive "$PID"; then
-      kill -9 "$PID" 2>/dev/null || true
-    fi
-  fi
-
-  rm -f "$f" || true
-  info "Closed: ${NAME:-"(unnamed)"} (local ${LOCAL} -> remote ${REMOTE} via ${SSH}, pid=${PID})"
+  close_one_local_port "$localp" "$force" || die "Failed to close tunnel: $target"
 }
 
 cmd_open() {
@@ -569,6 +591,7 @@ cmd_open() {
   local fav=0
   local no_warn=0
   local no_suggest=0
+  local replace=0
   local passthru=()
   local positional_count=0
 
@@ -583,6 +606,7 @@ cmd_open() {
       --favorite) fav=1 ;;
       --no-warn) no_warn=1 ;;
       --no-suggest) no_suggest=1 ;;
+      --replace) replace=1 ;;
       --local|--remote|--ssh|--name|--bind)
         local key="$1"; shift
         [[ $# -gt 0 ]] || usage_die "missing value for $key"
@@ -623,15 +647,29 @@ cmd_open() {
 
   local created_at
   created_at="$(now_iso)"
+
   if [[ -z "$name" ]]; then
+    if [[ "$replace" -eq 1 ]]; then
+      usage_die "--replace requires an explicit --name"
+    fi
     name="$sshc $localp->$remotep"
   fi
 
-  # enforce active-only name uniqueness
+  # if --replace and active name exists, close it first (name-only)
+  if [[ "$replace" -eq 1 ]]; then
+    local existing_local
+    existing_local="$(active_find_by_name "$name" || true)"
+    if [[ -n "$existing_local" ]]; then
+      info "Replacing active tunnel named '$name' (local port $existing_local)..."
+      cmd_close --force "$existing_local" >/dev/null 2>&1 || cmd_close "$existing_local" || true
+    fi
+  fi
+
+  # enforce active-only name uniqueness (post-replace)
   local existing_local
   existing_local="$(active_find_by_name "$name" || true)"
   if [[ -n "$existing_local" ]]; then
-    usage_die "An active tunnel already uses name '$name' (local port $existing_local). Close it first."
+    usage_die "An active tunnel already uses name '$name' (local port $existing_local). Close it first, or use --replace."
   fi
 
   local af
@@ -654,11 +692,9 @@ cmd_open() {
     fi
   fi
 
-  # launch ssh in background
   "$RTUNNEL_SSH_BIN" -N -L "${localp}:${bind}:${remotep}" "$sshc" "${passthru[@]}" >/dev/null 2>&1 &
   local pid="$!"
 
-  # write active env file
   {
     printf 'LOCAL=%q\n' "$localp"
     printf 'REMOTE=%q\n' "$remotep"
@@ -685,17 +721,56 @@ cmd_open() {
 
 cmd_history() {
   history_enabled_or_warn || exit 1
+
+  local filter_name=""
+  local favorites_only=0
+  local limit=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)
+        shift; [[ $# -gt 0 ]] || usage_die "missing value for --name"
+        filter_name="$1"
+        ;;
+      --name=*) filter_name="${1#--name=}" ;;
+      --favorites) favorites_only=1 ;;
+      --limit)
+        shift; [[ $# -gt 0 ]] || usage_die "missing value for --limit"
+        limit="$1"
+        ;;
+      --limit=*) limit="${1#--limit=}" ;;
+      -h|--help) usage_die "Usage: rtunnel history [--name NAME] [--favorites] [--limit N]" ;;
+      *) usage_die "unknown option for history: $1" ;;
+    esac
+    shift
+  done
+
+  [[ -z "$limit" || $(is_int "$limit" && echo ok) ]] || usage_die "--limit must be an integer"
+
   printf "%-6s %-24s %-6s %-6s %-28s %-6s %s\n" "ID" "CREATED_AT" "LOCAL" "REMOTE" "SSH" "FAV" "NAME"
   local any=0
+  local count=0
   local id
   while read -r id; do
     history_load_entry "$id" || continue
+
+    if [[ -n "$filter_name" && "$NAME" != "$filter_name" ]]; then
+      continue
+    fi
+    if [[ "$favorites_only" -eq 1 && "${FAVORITE:-0}" != "1" ]]; then
+      continue
+    fi
+
     any=1
     printf "%-6s %-24s %-6s %-6s %-28s %-6s %s\n" "$ID" "$CREATED_AT" "$LOCAL" "$REMOTE" "$SSH" "${FAVORITE:-0}" "$NAME"
+
+    count=$((count + 1))
+    if [[ -n "$limit" && "$count" -ge "$limit" ]]; then
+      break
+    fi
   done < <(history_iter_ids_desc)
-  if [[ "$any" -eq 0 ]]; then
-    info "No history yet."
-  fi
+
+  [[ "$any" -eq 0 ]] && info "No history yet."
 }
 
 resolve_last_history_id() {
@@ -769,8 +844,6 @@ cmd_reopen() {
   fi
 
   cmd_open --local="$LOCAL" --remote="$REMOTE" --ssh="$SSH" --name="$NAME" --bind "$BIND" -- "${HISTORY_ARGS[@]}"
-
-  # Always remember the last successfully reopened entry
   state_set "last-selected" "$id"
 }
 
@@ -893,9 +966,7 @@ cmd_favorites() {
       printf "%-6s %-24s %-6s %-6s %-28s %-6s %s\n" "$ID" "$CREATED_AT" "$LOCAL" "$REMOTE" "$SSH" "${FAVORITE:-0}" "$NAME"
     fi
   done < <(history_iter_ids_desc)
-  if [[ "$any" -eq 0 ]]; then
-    info "No favorites yet."
-  fi
+  [[ "$any" -eq 0 ]] && info "No favorites yet."
 }
 
 # ---------------- main ----------------

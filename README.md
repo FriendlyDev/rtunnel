@@ -46,7 +46,7 @@ Ensure `~/.local/bin` is in your `PATH`.
 ### Install a specific version
 
 ```bash
-curl -fsSL https://github.com/FriendlyDev/rtunnel/releases/latest/download/install.sh | bash -s -- --version v0.2.1
+curl -fsSL https://github.com/FriendlyDev/rtunnel/releases/latest/download/install.sh | bash -s -- --version v0.3.0
 ```
 
 ### Install location options
@@ -101,6 +101,17 @@ Mark it as a favorite at creation time:
 rtunnel open --favorite --name "grafana-staging" --local=80 --remote=8080 --ssh=user@hostname.tld
 ```
 
+#### Replace by name (restart a tunnel)
+If you re-run the same named tunnel frequently, you can replace any currently-active tunnel with the same name:
+
+```bash
+rtunnel open --replace --name "grafana-staging" --local=80 --remote=8080 --ssh=user@hostname.tld
+```
+
+Notes:
+- `--replace` replaces **by active name only**.
+- `--replace` requires an explicit `--name`.
+
 ### Private tunnels (no history)
 
 If you open a tunnel with `--private`, `rtunnel` will **not** save it to history and will **not** update “last opened” state. This means:
@@ -125,7 +136,7 @@ rtunnel open --private --no-warn --name "one-off" --local=3306 --remote=3306 --s
 rtunnel ls
 ```
 
-### Close a tunnel
+### Close tunnels
 
 Close by local port:
 
@@ -139,6 +150,24 @@ Close by active name:
 rtunnel close grafana-staging
 ```
 
+Close all tunnels (best-effort; exits non-zero if any close fails):
+
+```bash
+rtunnel close --all
+```
+
+Force close all tunnels (SIGKILL if SIGTERM doesn’t stop a tunnel):
+
+```bash
+rtunnel close --all --force
+```
+
+Remove stale entries (dead PIDs) without killing anything:
+
+```bash
+rtunnel close --stale
+```
+
 ---
 
 ## History
@@ -149,6 +178,24 @@ Show history:
 
 ```bash
 rtunnel history
+```
+
+Filter history by name:
+
+```bash
+rtunnel history --name "grafana-staging"
+```
+
+Show favorites only:
+
+```bash
+rtunnel history --favorites
+```
+
+Limit results:
+
+```bash
+rtunnel history --limit 20
 ```
 
 Reopen a tunnel from history (interactive; uses `fzf` if installed and enabled):
@@ -269,42 +316,6 @@ Install fzf:
 
 - macOS (Homebrew): `brew install fzf`
 - Linux: use your distro’s package manager
-
----
-
-## Shell completion
-
-### Bash completion
-
-Source the completion script from your `.bashrc`:
-
-```bash
-# Example path if you cloned the repo
-source /path/to/rtunnel/completions/rtunnel.bash
-```
-
-### Zsh completion
-
-Add the completion directory to your `$fpath` and enable `compinit`:
-
-```zsh
-fpath=(/path/to/rtunnel/completions $fpath)
-autoload -Uz compinit && compinit
-```
-
----
-
-## Release automation (for maintainers)
-
-This repository can publish releases automatically on push to `master`:
-
-- Reads version from `./rtunnel --version`
-- If tag `vX.Y.Z` does not exist, it creates:
-  - an **annotated git tag**
-  - a GitHub Release
-  - release assets: `rtunnel`, `install.sh`, `rtunnel.env.example`, `SHA256SUMS`
-
-This makes “bump version → push → release” the only manual steps.
 
 ---
 
