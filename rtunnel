@@ -329,12 +329,24 @@ GLOBAL:
   --help      Show help
   --version   Show version
 
-NOTES:
-  - Private tunnels: --private disables all history/state updates.
-    Private tunnels cannot be reopened with 'rtunnel reopen'.
+OPEN:
+  rtunnel open --local PORT --remote PORT --ssh USER@HOST [--name NAME] [--bind HOST] [--private] [--no-warn] [--favorite] [-- <ssh args...>]
+
+  --private   Do not write to history or "last opened" state. Private tunnels cannot be reopened.
+  --no-warn   Suppress warnings for this invocation (also: RTUNNEL_NO_WARN=1).
+  --favorite  Mark the created history entry as a favorite (ignored with --private).
+
+REOPEN:
+  rtunnel reopen [NAME|ID] [--last] [--prompt]
+
+  Default behavior is controlled by RTUNNEL_REOPEN_DEFAULT=prompt|last (default: prompt).
+  --last overrides and reopens the most recently opened non-private tunnel.
 
 CONFIG:
   RTUNNEL_HISTORY_ENABLED=1|0
+  RTUNNEL_FZF=1|0
+  RTUNNEL_DEFAULT_BIND=127.0.0.1
+  RTUNNEL_SSH_BIN=ssh
   RTUNNEL_REOPEN_DEFAULT=prompt|last
   RTUNNEL_NO_WARN=1       (disable warnings)
 
@@ -545,7 +557,7 @@ cmd_reopen() {
     case "$1" in
       --last) want_last=1 ;;
       --prompt) mode="prompt" ;;
-      -h|--help) usage_die "Usage: rtunnel reopen [NAME|ID] [--last]" ;;
+      -h|--help) usage_die "Usage: rtunnel reopen [NAME|ID] [--last] [--prompt]" ;;
       *)
         if [[ -z "$name_filter" && -z "$explicit_id" ]]; then
           if is_int "$1"; then
@@ -586,7 +598,9 @@ cmd_reopen() {
     die "An active tunnel already uses name '$NAME' (local port $existing_local). Close it first."
   fi
 
-  cmd_open --local="$LOCAL" --remote="$REMOTE" --ssh="$SSH" --name="$NAME" --bind="$BIND" -- "${HISTORY_ARGS[@]}"
+  cmd_open --local="$LOCAL" --remote="$REMOTE" --ssh="$SSH" --name="$NAME" --bind "$BIND" -- "${HISTORY_ARGS[@]}"
+
+  # Always remember the last successfully reopened entry (useful for tooling / debugging)
   state_set "last-selected" "$id"
 }
 

@@ -95,6 +95,12 @@ Name it (recommended):
 rtunnel open --name "grafana-staging" --local=80 --remote=8080 --ssh=user@hostname.tld
 ```
 
+Mark it as a favorite at creation time:
+
+```bash
+rtunnel open --favorite --name "grafana-staging" --local=80 --remote=8080 --ssh=user@hostname.tld
+```
+
 ### Private tunnels (no history)
 
 If you open a tunnel with `--private`, `rtunnel` will **not** save it to history and will **not** update “last opened” state. This means:
@@ -151,7 +157,7 @@ Reopen a tunnel from history (interactive; uses `fzf` if installed and enabled):
 rtunnel reopen
 ```
 
-Reopen by history id:
+Reopen by history id (the numeric ID shown in `rtunnel history`):
 
 ```bash
 rtunnel reopen 42
@@ -161,6 +167,12 @@ Reopen the most recently opened (non-private) tunnel:
 
 ```bash
 rtunnel reopen --last
+```
+
+To make `rtunnel reopen` default to reopening the most recent tunnel, set:
+
+```bash
+RTUNNEL_REOPEN_DEFAULT=last
 ```
 
 Forget an entry:
