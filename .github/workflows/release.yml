@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+# Opt into Node.js 24 for JavaScript-based actions (e.g. actions/checkout)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 concurrency:
   group: release-master
   cancel-in-progress: false
@@ -70,13 +74,11 @@ jobs:
           set -Eeuo pipefail
           chmod +x ./rtunnel ./install.sh
 
-          # Create a clean staging directory
           rm -rf dist
           mkdir -p dist
 
-          cp ./rtunnel ./install.sh ./README.md ./LICENSE dist/
+          cp ./rtunnel ./install.sh dist/
 
-          # Generate SHA256SUMS for the *downloaded* assets we care about
           (
             cd dist
             sha256sum rtunnel install.sh > SHA256SUMS
