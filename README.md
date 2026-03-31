@@ -1,6 +1,6 @@
 # rtunnel
 
-`rtunnel` is a security-minded, user-friendly SSH tunnel manager. It wraps SSH **local port forwarding** (`ssh -L ...`) with simple commands to **open**, **list**, and **close** tunnels, plus optional **history** and **favorites** so you can quickly reconnect later.
+`rtunnel` is a security-minded, user-friendly SSH tunnel manager. It wraps SSH **local port forwarding** (`ssh -L ...`) with simple commands to **open**, **list**, and **close** tunnels, with optional **history** so you can quickly reconnect later.
 
 It’s designed for macOS and Linux, and implemented as a small **bash** script with:
 - safe defaults (binds to loopback by default)
@@ -106,19 +106,13 @@ rtunnel open --private --name "one-off" --local=80 --remote=8080 --ssh=user@host
 rtunnel ls
 ```
 
-### Close a tunnel
-
-Close by local port:
+### Close a tunnel (by local port)
 
 ```bash
 rtunnel close 80
 ```
 
-Close by name (if you named it):
-
-```bash
-rtunnel close grafana-staging
-```
+> Note: Closing by **friendly name** is planned but not available yet.
 
 ---
 
@@ -141,31 +135,39 @@ rtunnel close grafana-staging
 
 History is **enabled by default**, and is controlled by `RTUNNEL_HISTORY_ENABLED`.
 
-When enabled, `rtunnel` can record tunnels you open, so you can reopen them quickly later.
+When enabled, `rtunnel` records tunnels you open, so you can reopen them quickly later.
 
-Common commands:
+Show history:
 
 ```bash
 rtunnel history
-rtunnel reopen            # interactive if fzf is installed
-rtunnel reopen @42        # reopen by history id
-rtunnel forget @42
-rtunnel name @42 "new name"
+```
+
+Reopen a tunnel from history (interactive if `fzf` is installed and enabled):
+
+```bash
+rtunnel reopen
+```
+
+Reopen by history id:
+
+```bash
+rtunnel reopen 42
+```
+
+Forget an entry:
+
+```bash
+rtunnel forget 42
+```
+
+Rename an entry:
+
+```bash
+rtunnel name 42 "new name"
 ```
 
 If history is disabled, these commands are hidden from help and will warn if invoked.
-
----
-
-## Favorites
-
-Favorites are a convenience layer on top of history (when history is enabled):
-
-```bash
-rtunnel fav grafana-staging
-rtunnel favorites
-rtunnel unfav grafana-staging
-```
 
 ---
 
@@ -179,7 +181,7 @@ Search order:
 2. `$XDG_CONFIG_HOME/rtunnel/rtunnel.env`
 3. `$HOME/.config/rtunnel/rtunnel.env`
 
-Start by copying the example:
+Start by copying the example config from the repository:
 
 ```bash
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/rtunnel"
@@ -243,6 +245,16 @@ This repository can publish releases automatically on push to `master`:
   - release assets: `rtunnel`, `install.sh`, `SHA256SUMS`
 
 This makes “bump version → push → release” the only manual steps.
+
+---
+
+## Roadmap
+
+Planned improvements:
+- Close and reopen tunnels by **friendly name**
+- Favorites (`fav`, `favorites`, `unfav`)
+- Secure round-trip replay of arbitrary extra SSH args (stored as a structured list, not a single string)
+- “Did you mean?” suggestions for mistyped names
 
 ---
 
