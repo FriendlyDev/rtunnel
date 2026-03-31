@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # rtunnel - SSH tunnel manager (bash).
 #
+# v0.2.1:
+# - "Did you mean?" suggestions (stderr) for name lookups
+# - Suggestions suppressible via RTUNNEL_NO_SUGGEST=1 or --no-suggest
+# - Suggestions are NOT suppressed by RTUNNEL_NO_WARN
+#
 # v0.2.0:
 # - Explicit bash script (not POSIX sh)
 # - Structured history storage + safe arg replay (no eval)
@@ -16,7 +21,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 
 # ---------------- logging helpers ----------------
 info() { printf '%s\n' "$*"; }
@@ -43,6 +48,7 @@ init_config() {
   : "${RTUNNEL_SSH_BIN:=ssh}"
   : "${RTUNNEL_REOPEN_DEFAULT:=prompt}"  # prompt|last
   : "${RTUNNEL_NO_WARN:=0}"              # 1 disables warnings
+  : "${RTUNNEL_NO_SUGGEST:=0}"           # 1 disables "Did you mean?" suggestions
 
   if [[ "${RTUNNEL_ENV_FILE:-}" != "" ]]; then
     load_env_file "$RTUNNEL_ENV_FILE"
@@ -96,6 +102,130 @@ warnings_enabled() {
   [[ "${RTUNNEL_NO_WARN}" != "1" ]]
 }
 
+suggestions_enabled() {
+  [[ "${RTUNNEL_NO_SUGGEST}" != "1" ]]
+}
+
+# ---------------- "did you mean" helpers ----------------
+# Domain-only suggestions:
+# - close -> active names
+# - reopen/fav/unfav -> history names
+normalize_name() {
+  # lower-case, map separators to spaces, squeeze whitespace
+  # shellcheck disable=SC2001
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr '-_.' '   ' \
+    | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+name_tokens() {
+  normalize_name "$1" | tr ' ' '\n' | awk 'NF>0{print}'
+}
+
+contains_all_tokens() {
+  local needle="$1" cand="$2"
+  local cand_norm
+  cand_norm="$(normalize_name "$cand")"
+  local t
+  while read -r t; do
+    [[ -n "$t" ]] || continue
+    [[ "$cand_norm" == *"$t"* ]] || return 1
+  done < <(name_tokens "$needle")
+  return 0
+}
+
+score_candidate() {
+  # Higher is better.
+  # Inputs: needle candidate
+  local needle="$1" cand="$2"
+  local n c
+  n="$(normalize_name "$needle")"
+  c="$(normalize_name "$cand")"
+
+  local score=0
+
+  if [[ "$c" == "$n" ]]; then
+    score=$((score + 1000))
+  fi
+  if [[ "$c" == "$n"* ]]; then
+    score=$((score + 300))
+  fi
+  if [[ "$c" == *"$n"* ]]; then
+    score=$((score + 200))
+  fi
+  if contains_all_tokens "$needle" "$cand"; then
+    score=$((score + 120))
+  fi
+
+  # Prefer shorter candidates if equal
+  score=$((score - ${#c}))
+  printf '%s\n' "$score"
+}
+
+suggest_from_candidates() {
+  # usage: suggest_from_candidates <needle> <limit>
+  # reads candidates from stdin, prints suggestions (one per line) to stdout
+  local needle="$1" limit="$2"
+
+  # score<TAB>candidate
+  awk -v needle="$needle" '
+    BEGIN{ }
+    { print $0 }
+  ' >/dev/null
+
+  local scored
+  scored="$(
+    while IFS= read -r cand; do
+      [[ -n "$cand" ]] || continue
+      printf '%s\t%s\n' "$(score_candidate "$needle" "$cand")" "$cand"
+    done
+  )"
+
+  # filter >0, sort by score desc, unique candidates, take top N
+  printf '%s\n' "$scored" \
+    | awk -F $'\t' '$1>0{print}' \
+    | sort -t $'\t' -k1,1nr -k2,2 \
+    | awk -F $'\t' '!seen[$2]++{print $2}' \
+    | head -n "$limit"
+}
+
+print_suggestions_stderr() {
+  # usage: print_suggestions_stderr <needle> <domain> <no_suggest_flag>
+  local needle="$1" domain="$2" no_suggest_flag="${3:-0}"
+
+  [[ "$no_suggest_flag" -eq 1 ]] && return 0
+  suggestions_enabled || return 0
+
+  local candidates=""
+  case "$domain" in
+    active)
+      candidates="$(active_names_unique || true)"
+      ;;
+    history)
+      candidates="$(history_names_unique || true)"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  [[ -n "$candidates" ]] || return 0
+
+  local sug
+  sug="$(
+    printf '%s\n' "$candidates" \
+      | suggest_from_candidates "$needle" 3
+  )"
+
+  [[ -n "$sug" ]] || return 0
+
+  warn "Did you mean:"
+  while IFS= read -r s; do
+    warn "  - $s"
+  done <<<"$sug"
+}
+
 # ---------------- active tracking ----------------
 active_file_for_local() { printf '%s/%s.env\n' "$RTUNNEL_ACTIVE_DIR" "$1"; }
 
@@ -126,6 +256,12 @@ active_list() {
     load_kv_file "$f" || continue
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${LOCAL:-}" "${REMOTE:-}" "${PID:-}" "${SSH:-}" "${NAME:-}" "${CREATED_AT:-}"
   done
+}
+
+active_names_unique() {
+  # Active domain suggestion source (unique, non-empty)
+  cleanup_stale_active
+  active_list | awk -F $'\t' 'NF>=5 && $5!=""{print $5}' | awk '!seen[$0]++'
 }
 
 active_find_by_name() {
@@ -238,6 +374,14 @@ history_rows_for_prompt() {
   done < <(history_iter_ids_desc)
 }
 
+history_names_unique() {
+  history_enabled_or_warn || return 0
+  history_iter_ids_desc | while read -r i; do
+    history_load_entry "$i" || continue
+    [[ -n "${NAME:-}" ]] && printf '%s\n' "$NAME"
+  done | awk '!seen[$0]++'
+}
+
 resolve_id_by_name_most_recent() {
   local needle="$1"
   local id
@@ -330,14 +474,15 @@ GLOBAL:
   --version   Show version
 
 OPEN:
-  rtunnel open --local PORT --remote PORT --ssh USER@HOST [--name NAME] [--bind HOST] [--private] [--no-warn] [--favorite] [-- <ssh args...>]
+  rtunnel open --local PORT --remote PORT --ssh USER@HOST [--name NAME] [--bind HOST] [--private] [--no-warn] [--favorite] [--no-suggest] [-- <ssh args...>]
 
-  --private   Do not write to history or "last opened" state. Private tunnels cannot be reopened.
-  --no-warn   Suppress warnings for this invocation (also: RTUNNEL_NO_WARN=1).
-  --favorite  Mark the created history entry as a favorite (ignored with --private).
+  --private     Do not write to history or "last opened" state. Private tunnels cannot be reopened.
+  --no-warn     Suppress warnings for this invocation (also: RTUNNEL_NO_WARN=1).
+  --favorite    Mark the created history entry as a favorite (ignored with --private).
+  --no-suggest  Suppress "Did you mean?" suggestions for this invocation (also: RTUNNEL_NO_SUGGEST=1).
 
 REOPEN:
-  rtunnel reopen [NAME|ID] [--last] [--prompt]
+  rtunnel reopen [NAME|ID] [--last] [--prompt] [--no-suggest]
 
   Default behavior is controlled by RTUNNEL_REOPEN_DEFAULT=prompt|last (default: prompt).
   --last overrides and reopens the most recently opened non-private tunnel.
@@ -348,7 +493,8 @@ CONFIG:
   RTUNNEL_DEFAULT_BIND=127.0.0.1
   RTUNNEL_SSH_BIN=ssh
   RTUNNEL_REOPEN_DEFAULT=prompt|last
-  RTUNNEL_NO_WARN=1       (disable warnings)
+  RTUNNEL_NO_WARN=1        (disable warnings)
+  RTUNNEL_NO_SUGGEST=1     (disable suggestions)
 
 EOF
 }
@@ -371,6 +517,14 @@ cmd_close() {
   [[ $# -ge 1 ]] || usage_die "close requires a local port or active name"
   cleanup_stale_active
 
+  local no_suggest=0
+  if [[ "${1:-}" == "--no-suggest" ]]; then
+    no_suggest=1
+    shift
+  fi
+
+  [[ $# -ge 1 ]] || usage_die "close requires a local port or active name"
+
   local target="$1"
   local localp=""
 
@@ -378,7 +532,11 @@ cmd_close() {
     localp="$target"
   else
     localp="$(active_find_by_name "$target" || true)"
-    [[ -n "$localp" ]] || die "No active tunnel found with name: $target"
+    if [[ -z "$localp" ]]; then
+      warn "No active tunnel found with name: $target"
+      print_suggestions_stderr "$target" "active" "$no_suggest"
+      exit 1
+    fi
   fi
 
   local f
@@ -410,6 +568,7 @@ cmd_open() {
   local bind="${RTUNNEL_DEFAULT_BIND}"
   local fav=0
   local no_warn=0
+  local no_suggest=0
   local passthru=()
   local positional_count=0
 
@@ -423,6 +582,7 @@ cmd_open() {
       --private) private=1 ;;
       --favorite) fav=1 ;;
       --no-warn) no_warn=1 ;;
+      --no-suggest) no_suggest=1 ;;
       --local|--remote|--ssh|--name|--bind)
         local key="$1"; shift
         [[ $# -gt 0 ]] || usage_die "missing value for $key"
@@ -552,12 +712,14 @@ cmd_reopen() {
   local want_last=0
   local name_filter=""
   local explicit_id=""
+  local no_suggest=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --last) want_last=1 ;;
       --prompt) mode="prompt" ;;
-      -h|--help) usage_die "Usage: rtunnel reopen [NAME|ID] [--last] [--prompt]" ;;
+      --no-suggest) no_suggest=1 ;;
+      -h|--help) usage_die "Usage: rtunnel reopen [NAME|ID] [--last] [--prompt] [--no-suggest]" ;;
       *)
         if [[ -z "$name_filter" && -z "$explicit_id" ]]; then
           if is_int "$1"; then
@@ -581,7 +743,13 @@ cmd_reopen() {
       id="$(resolve_last_history_id)"
     else
       id="$(pick_history_id_prompt "$name_filter" || true)"
-      [[ -n "$id" ]] || die "No matching history entries."
+      if [[ -z "$id" ]]; then
+        warn "No matching history entries."
+        if [[ -n "$name_filter" ]]; then
+          print_suggestions_stderr "$name_filter" "history" "$no_suggest"
+        fi
+        exit 1
+      fi
       state_set "last-selected" "$id"
     fi
   fi
@@ -589,7 +757,9 @@ cmd_reopen() {
   history_load_entry "$id" || die "History entry not found: $id"
 
   if [[ -n "$name_filter" && "$NAME" != "$name_filter" ]]; then
-    die "Selected/last entry does not match requested name '$name_filter'."
+    warn "Selected/last entry does not match requested name '$name_filter'."
+    print_suggestions_stderr "$name_filter" "history" "$no_suggest"
+    exit 1
   fi
 
   local existing_local
@@ -600,7 +770,7 @@ cmd_reopen() {
 
   cmd_open --local="$LOCAL" --remote="$REMOTE" --ssh="$SSH" --name="$NAME" --bind "$BIND" -- "${HISTORY_ARGS[@]}"
 
-  # Always remember the last successfully reopened entry (useful for tooling / debugging)
+  # Always remember the last successfully reopened entry
   state_set "last-selected" "$id"
 }
 
@@ -663,6 +833,12 @@ set_favorite() {
 
 cmd_fav() {
   history_enabled_or_warn || exit 1
+  local no_suggest=0
+  if [[ "${1:-}" == "--no-suggest" ]]; then
+    no_suggest=1
+    shift
+  fi
+
   [[ $# -ge 1 ]] || usage_die "fav requires a history id or name"
   local target="$1"
   local id=""
@@ -670,7 +846,11 @@ cmd_fav() {
     id="$target"
   else
     id="$(resolve_id_by_name_most_recent "$target" || true)"
-    [[ -n "$id" ]] || die "No history entry found with name: $target"
+    if [[ -z "$id" ]]; then
+      warn "No history entry found with name: $target"
+      print_suggestions_stderr "$target" "history" "$no_suggest"
+      exit 1
+    fi
   fi
   set_favorite "$id" "1"
   info "Favorited: id=$id"
@@ -678,6 +858,12 @@ cmd_fav() {
 
 cmd_unfav() {
   history_enabled_or_warn || exit 1
+  local no_suggest=0
+  if [[ "${1:-}" == "--no-suggest" ]]; then
+    no_suggest=1
+    shift
+  fi
+
   [[ $# -ge 1 ]] || usage_die "unfav requires a history id or name"
   local target="$1"
   local id=""
@@ -685,7 +871,11 @@ cmd_unfav() {
     id="$target"
   else
     id="$(resolve_id_by_name_most_recent "$target" || true)"
-    [[ -n "$id" ]] || die "No history entry found with name: $target"
+    if [[ -z "$id" ]]; then
+      warn "No history entry found with name: $target"
+      print_suggestions_stderr "$target" "history" "$no_suggest"
+      exit 1
+    fi
   fi
   set_favorite "$id" "0"
   info "Unfavorited: id=$id"

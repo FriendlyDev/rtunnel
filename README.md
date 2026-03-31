@@ -46,7 +46,7 @@ Ensure `~/.local/bin` is in your `PATH`.
 ### Install a specific version
 
 ```bash
-curl -fsSL https://github.com/FriendlyDev/rtunnel/releases/latest/download/install.sh | bash -s -- --version v0.2.0
+curl -fsSL https://github.com/FriendlyDev/rtunnel/releases/latest/download/install.sh | bash -s -- --version v0.2.1
 ```
 
 ### Install location options
@@ -175,17 +175,19 @@ To make `rtunnel reopen` default to reopening the most recent tunnel, set:
 RTUNNEL_REOPEN_DEFAULT=last
 ```
 
-Forget an entry:
+---
 
-```bash
-rtunnel forget 42
-```
+## "Did you mean?" suggestions
 
-Rename an entry:
+When you type a name that doesn’t exist, `rtunnel` will suggest close matches (printed to stderr):
 
-```bash
-rtunnel name 42 "new name"
-```
+- `rtunnel close <name>` suggests from **active** tunnel names
+- `rtunnel reopen <name>`, `rtunnel fav <name>`, `rtunnel unfav <name>` suggest from **history** names
+
+To disable suggestions:
+
+- set `RTUNNEL_NO_SUGGEST=1`, or
+- pass `--no-suggest` to the command.
 
 ---
 
@@ -252,6 +254,9 @@ RTUNNEL_REOPEN_DEFAULT=prompt
 
 # warning control
 RTUNNEL_NO_WARN=0
+
+# suggestion control
+RTUNNEL_NO_SUGGEST=0
 ```
 
 ---
