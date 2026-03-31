@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # rtunnel - SSH tunnel manager (bash).
 #
+# v0.5.0:
+# - open: add --wait[=SECONDS] (opt-in; default 2.0s when flag present)
+# - add doctor (with --json, requires jq)
+# - tighten missing-jq behavior for --json to exit 2
+#
 # v0.4.0:
 # - Add --json output (requires jq) for read+write commands
-#   - open/close single -> JSON object
-#   - close --all -> JSON array
-#   - ls/history/favorites -> JSON array
 #
 # v0.3.0:
 # - open --replace (requires --name; replaces by active name only)
@@ -30,7 +32,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 # ---------------- logging helpers ----------------
 info() { printf '%s\n' "$*"; }
@@ -40,12 +42,24 @@ usage_die() { warn "$*"; warn "Try: rtunnel --help"; exit 2; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 is_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+is_number() { [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
 now_iso() { date "+%Y-%m-%dT%H:%M:%S%z"; }
 
 require_jq_for_json() {
   if ! have jq; then
-    die "jq is required for --json output (install jq or omit --json)."
+    warn "jq is required for --json output (install jq or omit --json)."
+    exit 2
   fi
+}
+
+sleep_seconds() {
+  # portable sleep that supports fractional seconds on common systems
+  # If fractional sleep fails, fall back to integer.
+  local s="$1"
+  if sleep "$s" 2>/dev/null; then
+    return 0
+  fi
+  sleep "${s%.*}" 2>/dev/null || sleep 1
 }
 
 # ---------------- config loading ----------------
@@ -65,12 +79,21 @@ init_config() {
   : "${RTUNNEL_NO_WARN:=0}"              # 1 disables warnings
   : "${RTUNNEL_NO_SUGGEST:=0}"           # 1 disables "Did you mean?" suggestions
 
+  # For doctor reporting (optional)
+  RTUNNEL_CONFIG_FILE_USED=""
+
   if [[ "${RTUNNEL_ENV_FILE:-}" != "" ]]; then
+    RTUNNEL_CONFIG_FILE_USED="$RTUNNEL_ENV_FILE"
     load_env_file "$RTUNNEL_ENV_FILE"
   else
     local base="${XDG_CONFIG_HOME:-$HOME/.config}"
-    load_env_file "$base/rtunnel/rtunnel.env"
-    load_env_file "$HOME/.config/rtunnel/rtunnel.env"
+    if [[ -f "$base/rtunnel/rtunnel.env" ]]; then
+      RTUNNEL_CONFIG_FILE_USED="$base/rtunnel/rtunnel.env"
+      load_env_file "$base/rtunnel/rtunnel.env"
+    elif [[ -f "$HOME/.config/rtunnel/rtunnel.env" ]]; then
+      RTUNNEL_CONFIG_FILE_USED="$HOME/.config/rtunnel/rtunnel.env"
+      load_env_file "$HOME/.config/rtunnel/rtunnel.env"
+    fi
   fi
 
   : "${RTUNNEL_DIR:=${XDG_CONFIG_HOME:-$HOME/.config}/rtunnel}"
@@ -115,95 +138,6 @@ load_kv_file() {
 
 warnings_enabled() { [[ "${RTUNNEL_NO_WARN}" != "1" ]]; }
 suggestions_enabled() { [[ "${RTUNNEL_NO_SUGGEST}" != "1" ]]; }
-
-# ---------------- json helpers ----------------
-# Transform tab-delimited rows to JSON using jq (required).
-# IMPORTANT: In --json mode, commands should print ONLY JSON on stdout.
-json_active_array() {
-  require_jq_for_json
-  active_list | jq -Rn '
-    [inputs
-     | split("\t")
-     | {
-         local: .[0],
-         remote: .[1],
-         pid: (.[2] | tonumber? // .[2]),
-         ssh: .[3],
-         name: .[4],
-         created_at: .[5]
-       }
-    ]'
-}
-
-json_history_array() {
-  # stdin: history_rows_for_prompt output:
-  # ID, CREATED_AT, LOCAL, REMOTE, SSH, NAME, FAVORITE
-  require_jq_for_json
-  jq -Rn '
-    [inputs
-     | split("\t")
-     | {
-         id: (.[0] | tonumber? // .[0]),
-         created_at: .[1],
-         local: .[2],
-         remote: .[3],
-         ssh: .[4],
-         name: .[5],
-         favorite: (.[6] == "1")
-       }
-    ]'
-}
-
-json_open_object() {
-  # args: created_at local remote pid ssh name bind private history_id
-  require_jq_for_json
-  local created_at="$1" localp="$2" remotep="$3" pid="$4" sshc="$5" name="$6" bind="$7" private="$8" history_id="$9"
-  jq -n \
-    --arg created_at "$created_at" \
-    --arg local "$localp" \
-    --arg remote "$remotep" \
-    --arg ssh "$sshc" \
-    --arg name "$name" \
-    --arg bind "$bind" \
-    --arg pid "$pid" \
-    --argjson private "$private" \
-    --arg history_id "$history_id" \
-    '{
-      created_at: $created_at,
-      local: $local,
-      remote: $remote,
-      pid: ($pid | tonumber? // $pid),
-      ssh: $ssh,
-      name: $name,
-      bind: $bind,
-      private: $private
-    }
-    + (if ($history_id|length)>0 then {history_id: ($history_id|tonumber? // $history_id)} else {} end)
-    '
-}
-
-json_close_object() {
-  # args: created_at local remote pid ssh name bind
-  require_jq_for_json
-  local created_at="$1" localp="$2" remotep="$3" pid="$4" sshc="$5" name="$6" bind="$7"
-  jq -n \
-    --arg created_at "$created_at" \
-    --arg local "$localp" \
-    --arg remote "$remotep" \
-    --arg ssh "$sshc" \
-    --arg name "$name" \
-    --arg bind "$bind" \
-    --arg pid "$pid" \
-    '{
-      created_at: $created_at,
-      local: $local,
-      remote: $remote,
-      pid: ($pid | tonumber? // $pid),
-      ssh: $ssh,
-      name: $name,
-      bind: $bind
-    }'
-}
 
 # ---------------- "did you mean" helpers ----------------
 normalize_name() {
@@ -313,7 +247,6 @@ active_list() {
     local LOCAL REMOTE PID SSH NAME CREATED_AT BIND
     LOCAL=""; REMOTE=""; PID=""; SSH=""; NAME=""; CREATED_AT=""; BIND=""
     load_kv_file "$f" || continue
-    # keep output stable for json: include BIND at end (v0.4.0)
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${LOCAL:-}" "${REMOTE:-}" "${PID:-}" "${SSH:-}" "${NAME:-}" "${CREATED_AT:-}" "${BIND:-}"
   done
 }
@@ -506,6 +439,56 @@ pick_history_id_prompt() {
   printf '%s\n' "${ids[$((sel-1))]}"
 }
 
+# ---------------- json object helpers ----------------
+json_open_object() {
+  require_jq_for_json
+  local created_at="$1" localp="$2" remotep="$3" pid="$4" sshc="$5" name="$6" bind="$7" private="$8" history_id="$9"
+  jq -n \
+    --arg created_at "$created_at" \
+    --arg local "$localp" \
+    --arg remote "$remotep" \
+    --arg ssh "$sshc" \
+    --arg name "$name" \
+    --arg bind "$bind" \
+    --arg pid "$pid" \
+    --argjson private "$private" \
+    --arg history_id "$history_id" \
+    '{
+      created_at: $created_at,
+      local: $local,
+      remote: $remote,
+      pid: ($pid | tonumber? // $pid),
+      ssh: $ssh,
+      name: $name,
+      bind: $bind,
+      private: $private
+    }
+    + (if ($history_id|length)>0 then {history_id: ($history_id|tonumber? // $history_id)} else {} end)
+    '
+}
+
+json_close_object() {
+  require_jq_for_json
+  local created_at="$1" localp="$2" remotep="$3" pid="$4" sshc="$5" name="$6" bind="$7"
+  jq -n \
+    --arg created_at "$created_at" \
+    --arg local "$localp" \
+    --arg remote "$remotep" \
+    --arg ssh "$sshc" \
+    --arg name "$name" \
+    --arg bind "$bind" \
+    --arg pid "$pid" \
+    '{
+      created_at: $created_at,
+      local: $local,
+      remote: $remote,
+      pid: ($pid | tonumber? // $pid),
+      ssh: $ssh,
+      name: $name,
+      bind: $bind
+    }'
+}
+
 # ---------------- commands ----------------
 print_help() {
   cat <<EOF
@@ -525,26 +508,99 @@ COMMANDS:
   fav         Mark a history entry as favorite (by id or name)
   unfav       Unmark favorite
   favorites   List favorites
-
-GLOBAL:
-  --help      Show help
-  --version   Show version
+  doctor      Show environment/config diagnostics
 
 JSON:
   --json      Output JSON to stdout (requires jq). In --json mode, commands do not print human text to stdout.
 
 OPEN:
-  rtunnel open --local PORT --remote PORT --ssh USER@HOST [--name NAME] [--bind HOST] [--private] [--no-warn] [--favorite] [--replace] [--no-suggest] [--json] [-- <ssh args...>]
+  rtunnel open --local PORT --remote PORT --ssh USER@HOST [--name NAME] [--bind HOST] [--private] [--no-warn] [--favorite] [--replace] [--no-suggest] [--wait[=SECONDS]] [--json] [-- <ssh args...>]
 
-CLOSE:
-  rtunnel close <local-port|active-name> [--force] [--no-suggest] [--json]
-  rtunnel close --all [--force] [--json]
-  rtunnel close --stale [--json]
+  --wait[=S]  Opt-in: after spawning ssh, wait up to S seconds (default 2.0) and fail if ssh exits early.
 
-HISTORY:
-  rtunnel history [--name NAME] [--favorites] [--limit N] [--json]
+DOCTOR:
+  rtunnel doctor [--json]
 
 EOF
+}
+
+cmd_doctor() {
+  local as_json=0
+  if [[ "${1:-}" == "--json" ]]; then
+    as_json=1
+    shift
+  fi
+  [[ $# -eq 0 ]] || usage_die "doctor takes no args (except --json)"
+
+  cleanup_stale_active
+
+  local ssh_ok=0 jq_ok=0 fzf_ok=0
+  have "$RTUNNEL_SSH_BIN" && ssh_ok=1
+  have jq && jq_ok=1
+  have fzf && fzf_ok=1
+
+  local active_count stale_count
+  active_count="$(ls -1 "$RTUNNEL_ACTIVE_DIR"/*.env 2>/dev/null | wc -l | tr -d ' ')"
+  stale_count="$(
+    shopt -s nullglob
+    local c=0 f pid
+    for f in "$RTUNNEL_ACTIVE_DIR"/*.env; do
+      pid="$(awk -F= '$1=="PID"{print $2}' "$f" 2>/dev/null || true)"
+      pid="${pid//\"/}"
+      if ! pid_alive "$pid"; then
+        c=$((c + 1))
+      fi
+    done
+    printf '%s\n' "$c"
+  )"
+
+  if [[ "$as_json" -eq 1 ]]; then
+    require_jq_for_json
+    jq -n \
+      --arg version "$VERSION" \
+      --arg ssh_bin "$RTUNNEL_SSH_BIN" \
+      --arg config_file_used "$RTUNNEL_CONFIG_FILE_USED" \
+      --arg rtunnel_dir "$RTUNNEL_DIR" \
+      --arg active_dir "$RTUNNEL_ACTIVE_DIR" \
+      --arg history_dir "$RTUNNEL_HISTORY_DIR" \
+      --arg state_dir "$RTUNNEL_STATE_DIR" \
+      --argjson ssh_available "$ssh_ok" \
+      --argjson jq_available "$jq_ok" \
+      --argjson fzf_available "$fzf_ok" \
+      --argjson history_enabled "$RTUNNEL_HISTORY_ENABLED" \
+      --argjson active_count "$active_count" \
+      --argjson stale_count "$stale_count" \
+      '{
+        version: $version,
+        ssh: {bin: $ssh_bin, available: ($ssh_available==1)},
+        jq_available: ($jq_available==1),
+        fzf_available: ($fzf_available==1),
+        config_file_used: ($config_file_used | if length==0 then null else . end),
+        paths: {
+          rtunnel_dir: $rtunnel_dir,
+          active_dir: $active_dir,
+          history_dir: $history_dir,
+          state_dir: $state_dir
+        },
+        history_enabled: ($history_enabled==1),
+        active: {count: $active_count, stale_count: $stale_count}
+      }'
+    return 0
+  fi
+
+  info "rtunnel doctor"
+  info "  version:            $VERSION"
+  info "  config file used:   ${RTUNNEL_CONFIG_FILE_USED:-"(none)"}"
+  info "  ssh bin:            $RTUNNEL_SSH_BIN (available=$ssh_ok)"
+  info "  jq available:       $jq_ok (required only for --json)"
+  info "  fzf available:      $fzf_ok"
+  info "  history enabled:    $RTUNNEL_HISTORY_ENABLED"
+  info "  paths:"
+  info "    RTUNNEL_DIR:      $RTUNNEL_DIR"
+  info "    active:           $RTUNNEL_ACTIVE_DIR"
+  info "    history:          $RTUNNEL_HISTORY_DIR"
+  info "    state:            $RTUNNEL_STATE_DIR"
+  info "  active tunnels:     $active_count (stale: $stale_count)"
 }
 
 cmd_ls() {
@@ -558,7 +614,6 @@ cmd_ls() {
   [[ $# -eq 0 ]] || usage_die "ls takes no arguments (except --json)"
 
   if [[ "$as_json" -eq 1 ]]; then
-    # active_list now includes bind column; adjust json
     require_jq_for_json
     active_list | jq -Rn '
       [inputs
@@ -586,7 +641,6 @@ cmd_ls() {
 }
 
 close_one_local_port() {
-  # args: local_port force
   local localp="$1"
   local force="$2"
 
@@ -602,11 +656,11 @@ close_one_local_port() {
   local ok=0
   if pid_alive "$PID"; then
     kill "$PID" 2>/dev/null || true
-    sleep 0.1
+    sleep_seconds 0.1
     if pid_alive "$PID"; then
       if [[ "$force" -eq 1 ]]; then
         kill -9 "$PID" 2>/dev/null || true
-        sleep 0.05
+        sleep_seconds 0.05
       fi
     fi
     pid_alive "$PID" && ok=1
@@ -614,7 +668,6 @@ close_one_local_port() {
 
   rm -f "$f" || true
 
-  # export the fields for the caller (for json)
   CLOSE_LOCAL="$LOCAL"
   CLOSE_REMOTE="$REMOTE"
   CLOSE_PID="$PID"
@@ -633,7 +686,6 @@ cmd_close() {
   local no_suggest=0
   local as_json=0
 
-  # parse flags for close (allow before mode selection)
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --force) force=1; shift ;;
@@ -669,7 +721,6 @@ cmd_close() {
 
     if [[ "$as_json" -eq 1 ]]; then
       require_jq_for_json
-      # output array of local ports removed
       printf '%s' "$out" | jq -Rn '[inputs | select(length>0) | {local: .}]'
     else
       [[ "$removed" -eq 0 ]] && info "No stale tunnels found."
@@ -691,16 +742,12 @@ cmd_close() {
       local lines=""
       while IFS=$'\t' read -r localp _remotep _pid _ssh _name _created _bind; do
         any=1
-        if close_one_local_port "$localp" "$force"; then
-          # success
-          lines+="$CLOSE_CREATED_AT"$'\t'"$CLOSE_LOCAL"$'\t'"$CLOSE_REMOTE"$'\t'"$CLOSE_PID"$'\t'"$CLOSE_SSH"$'\t'"$CLOSE_NAME"$'\t'"$CLOSE_BIND"$'\n'
-        else
+        if ! close_one_local_port "$localp" "$force"; then
           failed=1
-          lines+="$CLOSE_CREATED_AT"$'\t'"$CLOSE_LOCAL"$'\t'"$CLOSE_REMOTE"$'\t'"$CLOSE_PID"$'\t'"$CLOSE_SSH"$'\t'"$CLOSE_NAME"$'\t'"$CLOSE_BIND"$'\n'
         fi
+        lines+="$CLOSE_CREATED_AT"$'\t'"$CLOSE_LOCAL"$'\t'"$CLOSE_REMOTE"$'\t'"$CLOSE_PID"$'\t'"$CLOSE_SSH"$'\t'"$CLOSE_NAME"$'\t'"$CLOSE_BIND"$'\n'
       done < <(active_list)
 
-      # Output array of closed tunnels (best-effort). Exit code reflects failures.
       printf '%s' "$lines" | jq -Rn '
         [inputs
          | select(length>0)
@@ -774,6 +821,8 @@ cmd_open() {
   local no_suggest=0
   local replace=0
   local as_json=0
+  local wait_enabled=0
+  local wait_seconds="2.0"
   local passthru=()
   local positional_count=0
 
@@ -790,6 +839,14 @@ cmd_open() {
       --no-suggest) no_suggest=1 ;;
       --replace) replace=1 ;;
       --json) as_json=1 ;;
+      --wait)
+        wait_enabled=1
+        wait_seconds="2.0"
+        ;;
+      --wait=*)
+        wait_enabled=1
+        wait_seconds="${1#--wait=}"
+        ;;
       --local|--remote|--ssh|--name|--bind)
         local key="$1"; shift
         [[ $# -gt 0 ]] || usage_die "missing value for $key"
@@ -828,6 +885,10 @@ cmd_open() {
   is_int "$localp" || usage_die "--local must be an integer"
   is_int "$remotep" || usage_die "--remote must be an integer"
 
+  if [[ "$wait_enabled" -eq 1 ]]; then
+    is_number "$wait_seconds" || usage_die "--wait must be a number of seconds (e.g. --wait=2 or --wait=0.5)"
+  fi
+
   local created_at
   created_at="$(now_iso)"
 
@@ -838,17 +899,14 @@ cmd_open() {
     name="$sshc $localp->$remotep"
   fi
 
-  # if --replace and active name exists, close it first (name-only)
   if [[ "$replace" -eq 1 ]]; then
     local existing_local
     existing_local="$(active_find_by_name "$name" || true)"
     if [[ -n "$existing_local" ]]; then
-      # best-effort close
       cmd_close --force "$existing_local" >/dev/null 2>&1 || cmd_close "$existing_local" >/dev/null 2>&1 || true
     fi
   fi
 
-  # enforce active-only name uniqueness (post-replace)
   local existing_local
   existing_local="$(active_find_by_name "$name" || true)"
   if [[ -n "$existing_local" ]]; then
@@ -875,9 +933,38 @@ cmd_open() {
     fi
   fi
 
-  "$RTUNNEL_SSH_BIN" -N -L "${localp}:${bind}:${remotep}" "$sshc" "${passthru[@]}" >/dev/null 2>&1 &
+  local ssh_err
+  ssh_err="$(mktemp -t rtunnel-ssh-err.XXXXXX 2>/dev/null || mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$ssh_err' 2>/dev/null || true" RETURN
+
+  "$RTUNNEL_SSH_BIN" -N -L "${localp}:${bind}:${remotep}" "$sshc" "${passthru[@]}" >/dev/null 2>"$ssh_err" &
   local pid="$!"
 
+  if [[ "$wait_enabled" -eq 1 ]]; then
+    local elapsed="0.0"
+    local step="0.1"
+    while true; do
+      if ! pid_alive "$pid"; then
+        local tail
+        tail="$(tail -n 3 "$ssh_err" 2>/dev/null || true)"
+        warn "ssh process exited during --wait window (${wait_seconds}s)."
+        [[ -n "$tail" ]] && warn "ssh stderr (last lines):" && warn "$tail"
+        exit 1
+      fi
+
+      # stop when elapsed >= wait_seconds
+      # use awk for float compare/add
+      if awk -v e="$elapsed" -v w="$wait_seconds" 'BEGIN{exit !(e>=w)}'; then
+        break
+      fi
+
+      sleep_seconds "$step"
+      elapsed="$(awk -v e="$elapsed" -v s="$step" 'BEGIN{printf "%.1f", (e+s)}')"
+    done
+  fi
+
+  # write active env file ONLY after successful wait (or immediately if no wait)
   {
     printf 'LOCAL=%q\n' "$localp"
     printf 'REMOTE=%q\n' "$remotep"
@@ -974,10 +1061,8 @@ cmd_history() {
   local id
   while read -r id; do
     history_load_entry "$id" || continue
-
     [[ -n "$filter_name" && "$NAME" != "$filter_name" ]] && continue
     [[ "$favorites_only" -eq 1 && "${FAVORITE:-0}" != "1" ]] && continue
-
     any=1
     printf "%-6s %-24s %-6s %-6s %-28s %-6s %s\n" "$ID" "$CREATED_AT" "$LOCAL" "$REMOTE" "$SSH" "${FAVORITE:-0}" "$NAME"
     count=$((count + 1))
@@ -1148,7 +1233,6 @@ cmd_fav() {
   set_favorite "$id" "1"
 
   if [[ "$as_json" -eq 1 ]]; then
-    # output the updated entry object
     history_load_entry "$id" || die "History entry not found: $id"
     require_jq_for_json
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ID" "$CREATED_AT" "$LOCAL" "$REMOTE" "$SSH" "$NAME" "${FAVORITE:-0}" "$BIND" \
@@ -1264,6 +1348,7 @@ case "${1:-}" in
   fav) shift; cmd_fav "$@" ;;
   unfav) shift; cmd_unfav "$@" ;;
   favorites) shift; cmd_favorites "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
   "") print_help; exit 0 ;;
   *) usage_die "unknown command: $1" ;;
 esac
